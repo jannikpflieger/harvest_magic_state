@@ -1,0 +1,1 @@
+CLIFFORD_T_GATE_SET = {"id", "x", "y", "z", "h", "s", "sdg", "sx", "sxdg", "cx", "cz", "cy", "swap","iswap", "ecr", "dcx", "t", "tdg", "rz"}
