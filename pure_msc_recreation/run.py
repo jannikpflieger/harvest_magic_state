@@ -194,7 +194,6 @@ def visualize_msc_layout(layout: Layout, title: str = "MSC Layout") -> str:
     
     return "\n".join(lines)
 
-
 def test_visualizations():
     """
     Test function to demonstrate layout visualizations.
@@ -213,7 +212,6 @@ def test_visualizations():
     
     print("\n" + "=" * 40)
     print("Visualization test completed!")
-
 
 def main():
     # ---- knobs you can change ----

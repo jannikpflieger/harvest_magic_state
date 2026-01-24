@@ -263,6 +263,8 @@ def test_convert_to_PCB(num_qubits=3, depth=100, seed=42):
         pcb_dag = visualize_dag(pcb_circuit, "PBC Format Circuit DAG")
 
         print("\nTest completed successfully!")
+    
+        return pcb_dag
         
     except Exception as e:
         print(f"Error during PCB conversion: {e}")
