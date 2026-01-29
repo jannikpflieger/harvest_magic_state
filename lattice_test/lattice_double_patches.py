@@ -405,7 +405,35 @@ class LayoutEngine:
 
         return final_nodes, chosen
 
-    def visualize_solution(self, graph, pos, sol_edges, *, title="Steiner solution", terminals=None):
+    def _induced_subgraph(self, graph, pos, keep_nodes):
+        """
+        Return graph/pos restricted to keep_nodes.
+        Keeps only edges (u->v) where both u and v are kept.
+        """
+        keep_nodes = set(keep_nodes)
+
+        new_graph = {}
+        for u in keep_nodes:
+            if u in graph:
+                new_graph[u] = [(v, w) for (v, w) in graph[u] if v in keep_nodes]
+
+        new_pos = None
+        if pos is not None:
+            new_pos = {u: pos[u] for u in keep_nodes if u in pos}
+
+        return new_graph, new_pos
+
+    def visualize_solution(self, graph, pos, sol_edges, *, title="Steiner solution",
+                        terminals=None, only_used=True):
+        # compute the set of nodes used by the solution
+        used = set()
+        for a, b in sol_edges:
+            used.add(a); used.add(b)
+        if terminals:
+            used.update(terminals)
+
+        if only_used:
+            graph, pos = self._induced_subgraph(graph, pos, used)
         """
         Visualize the routing graph lightly, and highlight `sol_edges` strongly.
 
