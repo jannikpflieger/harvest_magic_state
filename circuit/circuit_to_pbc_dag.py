@@ -1,12 +1,17 @@
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 import numpy as np
 import traceback
 from pre_processing import convert_to_PCB
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.converters import circuit_to_dag
+from qiskit.transpiler.passes import RemoveFinalMeasurements
+from qiskit.transpiler import PassManager
 import matplotlib.pyplot as plt
 import networkx as nx
 import random
+
+import mqt.bench as mqtbench
+from mqt.bench import get_benchmark, BenchmarkLevel, targets
 
 def create_random_circuit(num_qubits, depth, seed=None):
     """
@@ -229,11 +234,8 @@ def visualize_dag(circuit, title="Circuit DAG"):
     
     return dag
 
-def test_convert_to_PCB(num_qubits=3, depth=100, seed=42):
+def test_convert_to_PCB(qc):
     """Test the convert_to_PCB function with a random circuit."""
-
-    # Create a random test circuit
-    qc = create_random_circuit(num_qubits, depth, seed)
     
     print("Generated random circuit:")
     print(qc)
@@ -270,10 +272,22 @@ def test_convert_to_PCB(num_qubits=3, depth=100, seed=42):
         print(f"Error during PCB conversion: {e}")
         traceback.print_exc()
 
+def mqt_bench_pipeline(num_qubits):
+    """Placeholder for MQT Bench pipeline integration."""
+    qc = get_benchmark("dj", BenchmarkLevel.NATIVEGATES, circuit_size=num_qubits, target=targets.get_target_for_gateset("clifford+t", num_qubits),opt_level=3)
+    
+    # Remove final measurements using transpile with specific pass
+    pm = PassManager(RemoveFinalMeasurements())
+    qc_without_measurements = pm.run(qc)
+    
+    return qc_without_measurements
+
 if __name__ == "__main__":
     # You can customize the circuit parameters here
     num_qubits = 20  # Number of qubits
     depth = 10       # Target depth
     seed = 42       # For reproducible results
     
-    test_convert_to_PCB(num_qubits, depth, seed)
+    qc = create_random_circuit(num_qubits, depth, seed)
+    #qc = mqt_bench_pipeline(num_qubits)
+    test_convert_to_PCB(qc)

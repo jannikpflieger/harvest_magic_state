@@ -157,45 +157,9 @@ class LayoutEngine:
                     if self.in_bounds(a) and self.is_free(a):
                         graph[pid].append((a, 0))
                         graph[a].append((pid, 0))
-        
-        graph, ports_by_patch, pos, patch_used_by_port = self._prune_degree0_nodes(graph, ports_by_patch, pos, patch_used_by_port)
 
         return graph, ports_by_patch, pos, patch_used_by_port
 
-    def _prune_degree0_nodes(self, graph, ports_by_patch, pos, patch_used_by_port):
-        """
-        Remove nodes u where graph[u] has no neighbors (degree 0).
-        Also prunes ports_by_patch / pos / patch_used_by_port accordingly.
-        """
-        keep = {u for u, nbrs in graph.items() if len(nbrs) > 0}
-
-        # prune graph + edges
-        new_graph = {}
-        for u, nbrs in graph.items():
-            if u not in keep:
-                continue
-            new_graph[u] = [(v, w) for (v, w) in nbrs if v in keep]
-
-        # prune pos
-        if pos is not None:
-            pos = {u: pos[u] for u in keep if u in pos}
-
-        # prune patch_used_by_port
-        if patch_used_by_port is not None:
-            patch_used_by_port = {u: patch_used_by_port[u] for u in keep if u in patch_used_by_port}
-
-        # prune ports_by_patch
-        if ports_by_patch is not None:
-            for p in list(ports_by_patch.keys()):
-                for t in list(ports_by_patch[p].keys()):
-                    ports_by_patch[p][t] = [pid for pid in ports_by_patch[p][t] if pid in keep]
-                    if not ports_by_patch[p][t]:
-                        del ports_by_patch[p][t]
-                if not ports_by_patch[p]:
-                    del ports_by_patch[p]
-
-        return new_graph, ports_by_patch, pos, patch_used_by_port
-    
 
     # -------------------------
     # Steiner / terminal routing helpers
@@ -405,35 +369,7 @@ class LayoutEngine:
 
         return final_nodes, chosen
 
-    def _induced_subgraph(self, graph, pos, keep_nodes):
-        """
-        Return graph/pos restricted to keep_nodes.
-        Keeps only edges (u->v) where both u and v are kept.
-        """
-        keep_nodes = set(keep_nodes)
-
-        new_graph = {}
-        for u in keep_nodes:
-            if u in graph:
-                new_graph[u] = [(v, w) for (v, w) in graph[u] if v in keep_nodes]
-
-        new_pos = None
-        if pos is not None:
-            new_pos = {u: pos[u] for u in keep_nodes if u in pos}
-
-        return new_graph, new_pos
-
-    def visualize_solution(self, graph, pos, sol_edges, *, title="Steiner solution",
-                        terminals=None, only_used=True):
-        # compute the set of nodes used by the solution
-        used = set()
-        for a, b in sol_edges:
-            used.add(a); used.add(b)
-        if terminals:
-            used.update(terminals)
-
-        if only_used:
-            graph, pos = self._induced_subgraph(graph, pos, used)
+    def visualize_solution(self, graph, pos, sol_edges, *, title="Steiner solution", terminals=None):
         """
         Visualize the routing graph lightly, and highlight `sol_edges` strongly.
 
@@ -526,7 +462,6 @@ class LayoutEngine:
         ax.set_xticks(range(0, self.W + 1))
         ax.set_yticks(range(0, self.H + 1))
         plt.show()
-
     # ---- visualization ----
     def visualize_layout(self, title="Layout", show_ports=True):
         fig, ax = plt.subplots(figsize=(max(6, self.W/3), max(4, self.H/3)))
