@@ -11,7 +11,7 @@ import mqt.bench as mqtbench
 from mqt.bench import get_benchmark, BenchmarkLevel, targets
 
 
-def convert_to_PCB(circuit, fix_clifford=True):
+def convert_to_PCB(circuit, fix_clifford=False):
     """
     Convert a quantum circuit to PCB (Pauli-based Circuit Block) format using LitinskiTransformation.
     

@@ -18,7 +18,7 @@ eng.visualize_layout("7x9 magic-ring + 4 paired 2Q patches")
 from __future__ import annotations
 from typing import Tuple
 
-from lattice_double_patches import LayoutEngine, magic_patch_1cell, paired_patches_2q_alternating, data_patch_1cell
+from lattice_test.lattice_double_patches import LayoutEngine, magic_patch_1cell, paired_patches_2q_alternating, data_patch_1cell
 
 Coord = Tuple[int, int]
 
