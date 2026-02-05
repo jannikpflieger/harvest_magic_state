@@ -94,27 +94,50 @@ class DAGProcessor:
                 
                 if patch_name in self.ports_by_patch:
                     # Get the appropriate port type based on the Pauli operation
-                    port_type = self._get_port_type_for_pauli_gate(node, qubit_index)
+                    port_type = self._get_port_type_for_pauli_gate(node, qubit_index, qubit_indices)
                     
-                    if port_type in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name][port_type]:
-                        # Use the first available port of this type
-                        terminal = self.ports_by_patch[patch_name][port_type][0]
-                        terminals.append(terminal)
-                        detailed_logger.info(f"Added terminal {terminal} for qubit {qubit_index} (port type: {port_type})")
+                    if port_type == 'Y':
+                        # Y operation requires both X and Z ports from the same qubit
+                        detailed_logger.info(f"Y operation detected for qubit {qubit_index} - adding both X and Z ports")
+                        
+                        # Add X port
+                        if 'X' in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name]['X']:
+                            x_terminal = self.ports_by_patch[patch_name]['X'][0]
+                            terminals.append(x_terminal)
+                            detailed_logger.info(f"Added X terminal {x_terminal} for Y operation on qubit {qubit_index}")
+                        else:
+                            logger.warning(f"No X ports available for Y operation on patch {patch_name}")
+                        
+                        # Add Z port
+                        if 'Z' in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name]['Z']:
+                            z_terminal = self.ports_by_patch[patch_name]['Z'][0]
+                            terminals.append(z_terminal)
+                            detailed_logger.info(f"Added Z terminal {z_terminal} for Y operation on qubit {qubit_index}")
+                        else:
+                            logger.warning(f"No Z ports available for Y operation on patch {patch_name}")
+                    
                     else:
-                        logger.warning(f"No {port_type} ports available for patch {patch_name}")
+                        # Single port type (X or Z)
+                        if port_type in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name][port_type]:
+                            # Use the first available port of this type
+                            terminal = self.ports_by_patch[patch_name][port_type][0]
+                            terminals.append(terminal)
+                            detailed_logger.info(f"Added terminal {terminal} for qubit {qubit_index} (port type: {port_type})")
+                        else:
+                            logger.warning(f"No {port_type} ports available for patch {patch_name}")
                 else:
                     logger.warning(f"Patch {patch_name} not found in layout")
         
         return terminals
     
-    def _get_port_type_for_pauli_gate(self, node, qubit_index):
+    def _get_port_type_for_pauli_gate(self, node, qubit_index, all_qubits_in_operation):
         """
         Determine the appropriate port type for a Pauli evolution gate acting on a specific qubit.
         
         Args:
             node: The DAG node (should be a PauliEvolution gate)
             qubit_index: The index of the qubit we're getting the port for
+            all_qubits_in_operation: List of all qubit indices in this operation
             
         Returns:
             str: Port type ('X', 'Z', or 'Y')
@@ -130,33 +153,56 @@ class DAGProcessor:
                     terms = list(operator.terms())
                     detailed_logger.info(f"Terms: {terms}")
                     
-                    # Each term is (bit_pattern, coefficient)
+                    # For multi-qubit operations, we need to parse the bit pattern
+                    # to determine which Pauli acts on which qubit
                     for bit_pattern, coeff in terms:
-                        # bit_pattern represents the Pauli operators
-                        # We need to find which Pauli acts on our qubit
                         detailed_logger.info(f"Bit pattern: {bit_pattern}, Coefficient: {coeff}")
                         
-                        # For SparseObservable, the bit pattern might encode X/Z operations
-                        # This is a simplified approach - might need adjustment
-                        if 'Z' in str(operator):
-                            return 'Z'
-                        elif 'X' in str(operator):
-                            return 'X' 
-                        elif 'Y' in str(operator):
-                            return 'Y'
-                        else:
-                            return 'Z'  # Default
+                        # Try to extract individual Pauli operations from the pattern
+                        # This is a simplified approach and might need refinement
+                        # For now, we'll analyze the string representation
+                        break
+                        
                 except Exception as e:
                     detailed_logger.warning(f"Could not parse SparseObservable terms: {e}")
             
-            # Try string representation as fallback
+            # Parse the string representation to extract per-qubit Pauli operations
             op_str = str(operator)
-            if 'Z' in op_str:
-                return 'Z'
-            elif 'X' in op_str:
-                return 'X'
-            elif 'Y' in op_str:
-                return 'Y'
+            detailed_logger.info(f"Operator string representation: {op_str}")
+            
+            # For multi-qubit operators, extract the Pauli string
+            # Example: "Z_1 Y_0" where indices refer to positions in the Pauli string, not circuit qubits
+            if '_' in op_str:
+                # Get the position of this qubit in the operation
+                try:
+                    qubit_position = all_qubits_in_operation.index(qubit_index)
+                    detailed_logger.info(f"Qubit {qubit_index} is at position {qubit_position} in operation")
+                except ValueError:
+                    detailed_logger.warning(f"Qubit {qubit_index} not found in operation qubits {all_qubits_in_operation}")
+                    return 'Z'  # fallback
+                
+                # Look for patterns like "X_N", "Y_N", "Z_N" where N is the position in Pauli string
+                import re
+                pattern = rf'([XYZ])_{qubit_position}(?:\D|$)'
+                match = re.search(pattern, op_str)
+                if match:
+                    pauli_op = match.group(1)
+                    detailed_logger.info(f"Found {pauli_op} operation for qubit {qubit_index} at position {qubit_position}")
+                    return pauli_op
+                else:
+                    detailed_logger.warning(f"No pattern match for position {qubit_position} in '{op_str}'")
+            else:
+                # Try to extract from a Pauli string format without underscores
+                # This is more complex for SparseObservable, so we'll use fallback
+                detailed_logger.info(f"No underscore pattern found in operator string")
+                
+                # Fallback: analyze the overall string for single operations
+                if 'Y' in op_str:
+                    return 'Y'
+                elif 'Z' in op_str:
+                    return 'Z'
+                elif 'X' in op_str:
+                    return 'X'
         
         # Check for legacy pauli attribute
         elif hasattr(node.op, 'pauli') and node.op.pauli is not None:
@@ -165,17 +211,13 @@ class DAGProcessor:
             
             # Find which Pauli operator acts on this qubit
             if qubit_index < len(pauli_str):
-                # Try both forward and reverse indexing
+                # Use reverse indexing as it's common in Qiskit (rightmost = qubit 0)
                 pauli_op_reverse = pauli_str[-(qubit_index+1)] if qubit_index < len(pauli_str) else 'I'
                 
                 detailed_logger.info(f"Qubit {qubit_index}: Pauli operator = {pauli_op_reverse}")
                 
-                if pauli_op_reverse == 'X':
-                    return 'X'
-                elif pauli_op_reverse == 'Z':
-                    return 'Z'
-                elif pauli_op_reverse == 'Y':
-                    return 'Y'
+                if pauli_op_reverse in ['X', 'Y', 'Z']:
+                    return pauli_op_reverse
                 else:  # 'I' or unknown
                     return 'Z'  # Default for identity or unknown
         
