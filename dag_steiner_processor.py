@@ -22,6 +22,10 @@ class DAGProcessor:
             layout_rows (int): Number of rows in the lattice layout
             layout_cols (int): Number of columns in the lattice layout
         """
+        # Store layout dimensions
+        self.layout_rows = layout_rows
+        self.layout_cols = layout_cols
+        
         # Setup the layout engine
         self.eng = nxm_ring_layout_single_qubits(layout_rows, layout_cols)
         self.graph, self.ports_by_patch, self.pos, self.patch_used_by_port = self.eng.build_routing_graph()
@@ -74,19 +78,110 @@ class DAGProcessor:
         terminals = []
         
         if node.qargs:
-            for qubit in node.qargs:
-                qubit_index = dag.find_bit(qubit).index
+            qubit_indices = [dag.find_bit(q).index for q in node.qargs]
+            detailed_logger.info(f"Node {node.op.name} acts on qubits: {qubit_indices}")
+            
+            # For Pauli evolution gates, we need terminals for each qubit the gate acts on
+            for qubit_index in qubit_indices:
                 # Map qubit index to layout patch
-                # Assuming logical qubits map to q_x_y patches
-                patch_name = f"q_{qubit_index//4}_{qubit_index%4}"  # Example mapping
+                # Simple mapping: q_0 -> q_0_0, q_1 -> q_0_1, q_2 -> q_1_0, etc.
+                # This assumes a row-major layout where qubits are arranged in rows
+                row = qubit_index // self.layout_cols
+                col = qubit_index % self.layout_cols
+                patch_name = f"q_{row}_{col}"
+                
+                detailed_logger.info(f"Mapping qubit {qubit_index} to patch {patch_name}")
                 
                 if patch_name in self.ports_by_patch:
-                    # Choose appropriate port type based on gate type
-                    port_type = self._get_port_type_for_gate(node.op.name)
-                    if port_type in self.ports_by_patch[patch_name]:
-                        terminals.append(self.ports_by_patch[patch_name][port_type][0])
+                    # Get the appropriate port type based on the Pauli operation
+                    port_type = self._get_port_type_for_pauli_gate(node, qubit_index)
+                    
+                    if port_type in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name][port_type]:
+                        # Use the first available port of this type
+                        terminal = self.ports_by_patch[patch_name][port_type][0]
+                        terminals.append(terminal)
+                        detailed_logger.info(f"Added terminal {terminal} for qubit {qubit_index} (port type: {port_type})")
+                    else:
+                        logger.warning(f"No {port_type} ports available for patch {patch_name}")
+                else:
+                    logger.warning(f"Patch {patch_name} not found in layout")
         
         return terminals
+    
+    def _get_port_type_for_pauli_gate(self, node, qubit_index):
+        """
+        Determine the appropriate port type for a Pauli evolution gate acting on a specific qubit.
+        
+        Args:
+            node: The DAG node (should be a PauliEvolution gate)
+            qubit_index: The index of the qubit we're getting the port for
+            
+        Returns:
+            str: Port type ('X', 'Z', or 'Y')
+        """
+        # For PauliEvolution gates, check the operator if available
+        if hasattr(node.op, 'operator') and node.op.operator is not None:
+            operator = node.op.operator
+            detailed_logger.info(f"Operator: {operator}")
+            
+            # Handle SparseObservable format
+            if hasattr(operator, 'terms'):
+                try:
+                    terms = list(operator.terms())
+                    detailed_logger.info(f"Terms: {terms}")
+                    
+                    # Each term is (bit_pattern, coefficient)
+                    for bit_pattern, coeff in terms:
+                        # bit_pattern represents the Pauli operators
+                        # We need to find which Pauli acts on our qubit
+                        detailed_logger.info(f"Bit pattern: {bit_pattern}, Coefficient: {coeff}")
+                        
+                        # For SparseObservable, the bit pattern might encode X/Z operations
+                        # This is a simplified approach - might need adjustment
+                        if 'Z' in str(operator):
+                            return 'Z'
+                        elif 'X' in str(operator):
+                            return 'X' 
+                        elif 'Y' in str(operator):
+                            return 'Y'
+                        else:
+                            return 'Z'  # Default
+                except Exception as e:
+                    detailed_logger.warning(f"Could not parse SparseObservable terms: {e}")
+            
+            # Try string representation as fallback
+            op_str = str(operator)
+            if 'Z' in op_str:
+                return 'Z'
+            elif 'X' in op_str:
+                return 'X'
+            elif 'Y' in op_str:
+                return 'Y'
+        
+        # Check for legacy pauli attribute
+        elif hasattr(node.op, 'pauli') and node.op.pauli is not None:
+            pauli_str = str(node.op.pauli)
+            detailed_logger.info(f"Pauli string: {pauli_str}")
+            
+            # Find which Pauli operator acts on this qubit
+            if qubit_index < len(pauli_str):
+                # Try both forward and reverse indexing
+                pauli_op_reverse = pauli_str[-(qubit_index+1)] if qubit_index < len(pauli_str) else 'I'
+                
+                detailed_logger.info(f"Qubit {qubit_index}: Pauli operator = {pauli_op_reverse}")
+                
+                if pauli_op_reverse == 'X':
+                    return 'X'
+                elif pauli_op_reverse == 'Z':
+                    return 'Z'
+                elif pauli_op_reverse == 'Y':
+                    return 'Y'
+                else:  # 'I' or unknown
+                    return 'Z'  # Default for identity or unknown
+        
+        # Fallback for other gate types
+        detailed_logger.info(f"Using fallback port type detection for gate: {node.op.name}")
+        return self._get_port_type_for_gate(node.op.name)
     
     def _get_port_type_for_gate(self, gate_name):
         """

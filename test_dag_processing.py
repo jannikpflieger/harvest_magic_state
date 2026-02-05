@@ -3,6 +3,7 @@ Simple test to demonstrate DAG processing with Steiner algorithm integration.
 """
 
 from circuit.circuit_to_pbc_dag import create_random_circuit, create_dag, convert_to_PCB
+from circuit.visualizer import visualize_dag
 from dag_steiner_processor import DAGProcessor, process_dag_with_steiner
 
 
@@ -14,7 +15,7 @@ def test_simple_dag_processing():
     print("="*50)
     
     # Create a simple test circuit
-    qc = create_random_circuit(num_qubits=3, depth=3, seed=42)
+    qc = create_random_circuit(num_qubits=4, depth=10, seed=42)
     print(f"Created circuit with {qc.num_qubits} qubits and depth {qc.depth()}")
     print(f"Original gates: {qc.count_ops()}")
     
@@ -25,11 +26,12 @@ def test_simple_dag_processing():
     
     # Create DAG
     dag = create_dag(pcb_circuit)
+    visualize_dag(dag, "Simple PCB Circuit DAG")
     print(f"DAG has {len(list(dag.op_nodes()))} operation nodes")
     
     # Process with Steiner algorithm
     processor, results = process_dag_with_steiner(
-        dag, layout_rows=3, layout_cols=3, visualize_steps=False
+        dag, layout_rows=4, layout_cols=1, visualize_steps=True
     )
     
     # Print detailed results
@@ -78,6 +80,6 @@ if __name__ == "__main__":
     print("\n" + "="*70 + "\n")
     
     # Run visualization test
-    processor2, results2 = test_step_by_step_visualization()
+    #processor2, results2 = test_step_by_step_visualization()
     
     print("\nAll tests completed!")
