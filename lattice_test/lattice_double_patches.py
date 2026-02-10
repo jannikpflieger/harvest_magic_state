@@ -405,6 +405,217 @@ class LayoutEngine:
 
         return final_nodes, chosen
 
+    def steiner_packing(self, graph, terminal_sets, *, prune_cycles=True, greedy_order="min_size"):
+        """
+        Approximate Steiner packing: find edge-disjoint Steiner trees for multiple terminal sets.
+        
+        Uses a greedy approach:
+        1) Order terminal sets by a heuristic (e.g., smallest sets first)
+        2) For each set, compute Steiner tree using remaining edges
+        3) Remove used edges from the graph for subsequent sets
+        
+        Args:
+            graph: adjacency list {node: [(nbr, w), ...]}
+            terminal_sets: list of lists, each containing terminal nodes for one tree
+            prune_cycles: if True, prune each Steiner tree to avoid cycles
+            greedy_order: ordering heuristic - "min_size", "max_size", or "original"
+        
+        Returns:
+            results: list of dicts, each containing:
+                - 'terminal_set': the original terminal set
+                - 'sol_nodes': set of nodes used by this Steiner tree  
+                - 'sol_edges': set of undirected edges used by this tree
+                - 'success': bool, whether a valid tree was found
+            remaining_graph: the graph after removing all used edges
+        """
+        if not terminal_sets:
+            return [], dict(graph)
+            
+        # Make a copy of the graph to modify
+        working_graph = {}
+        for u, nbrs in graph.items():
+            working_graph[u] = list(nbrs)  # shallow copy of neighbor list
+            
+        # Order terminal sets based on heuristic
+        if greedy_order == "min_size":
+            # Smallest sets first - they have fewer routing options
+            indexed_sets = sorted(enumerate(terminal_sets), key=lambda x: len(x[1]))
+        elif greedy_order == "max_size":
+            # Largest sets first - they might need more resources
+            indexed_sets = sorted(enumerate(terminal_sets), key=lambda x: len(x[1]), reverse=True)
+        else:  # "original" or any other value
+            indexed_sets = list(enumerate(terminal_sets))
+        
+        results = [None] * len(terminal_sets)  # maintain original order
+        
+        for orig_idx, terminals in indexed_sets:
+            try:
+                # Attempt to find Steiner tree with current available edges
+                sol_nodes, sol_edges = self.steiner_tree(working_graph, terminals, prune_cycles=prune_cycles)
+                
+                # Remove ALL ROUTING NODES used by this tree from the working graph
+                # (terminals/ports can still be used by other trees, but routing cells cannot)
+                routing_nodes_used = set()
+                terminal_nodes = set(terminals)
+                
+                for node in sol_nodes:
+                    # Only routing cells (coordinate tuples) are blocked, not port terminals
+                    if isinstance(node, tuple):  # routing cell
+                        routing_nodes_used.add(node)
+                
+                # Remove the used routing nodes and all their connections
+                for used_node in routing_nodes_used:
+                    if used_node in working_graph:
+                        del working_graph[used_node]
+                
+                # Remove connections to the used routing nodes from remaining nodes
+                for u in list(working_graph.keys()):
+                    working_graph[u] = [(v, w) for v, w in working_graph[u] 
+                                      if v not in routing_nodes_used]
+                
+                results[orig_idx] = {
+                    'terminal_set': terminals,
+                    'sol_nodes': sol_nodes,
+                    'sol_edges': sol_edges,
+                    'success': True
+                }
+                
+            except (ValueError, KeyError) as e:
+                # Failed to find valid Steiner tree (e.g., terminals not reachable)
+                results[orig_idx] = {
+                    'terminal_set': terminals,
+                    'sol_nodes': set(),
+                    'sol_edges': set(),
+                    'success': False,
+                    'error': str(e)
+                }
+        
+        return results, working_graph
+
+    def visualize_packing_solution(self, graph, pos, packing_results, *, title="Steiner Packing Solution", only_used=True):
+        """
+        Visualize multiple Steiner trees from packing with different colors.
+        
+        Args:
+            graph: original routing graph
+            pos: node positions
+            packing_results: results from steiner_packing()
+            title: plot title
+            only_used: if True, show only nodes/edges used by the solution
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+        
+        # Collect all used nodes and edges
+        all_used_nodes = set()
+        all_used_edges = set()
+        all_terminals = set()
+        
+        for result in packing_results:
+            if result['success']:
+                all_used_nodes.update(result['sol_nodes'])
+                all_used_edges.update(result['sol_edges'])
+            all_terminals.update(result['terminal_set'])
+        
+        if only_used:
+            graph, pos = self._induced_subgraph(graph, pos, all_used_nodes.union(all_terminals))
+        
+        fig, ax = plt.subplots(figsize=(max(6, self.W / 3), max(4, self.H / 3)))
+        
+        # Background tiles
+        for x in range(self.W):
+            for y in range(self.H):
+                c = (x, y)
+                status = self.occ.get(c, "FREE")
+                rect = plt.Rectangle((x, y), 1, 1, fill=True, edgecolor="k", linewidth=0.2)
+                if status == "FREE":
+                    rect.set_facecolor((1, 1, 1, 1))
+                elif status == "BLOCKED":
+                    rect.set_facecolor((0.9, 0.9, 0.9, 1))
+                else:
+                    rect.set_facecolor((1, 1, 1, 1))
+                    rect.set_hatch("///")
+                ax.add_patch(rect)
+
+        # Patch labels
+        for p in self.patches.values():
+            cx, cy = self._patch_centroid(p.cells)
+            ax.text(cx, cy, p.name, ha="center", va="center", fontsize=9)
+
+        # Draw graph edges faintly
+        faint_segments = []
+        seen = set()
+        for u, nbrs in graph.items():
+            for v, w in nbrs:
+                a, b = (u, v) if str(u) <= str(v) else (v, u)
+                key = (a, b, w)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if u in pos and v in pos and (a, b) not in all_used_edges:
+                    faint_segments.append([pos[u], pos[v]])
+        if faint_segments:
+            ax.add_collection(LineCollection(faint_segments, linewidths=0.4, colors=[(0, 0, 0, 0.15)]))
+
+        # Color scheme for different Steiner trees
+        colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+        
+        # Highlight solution edges with different colors per tree
+        for i, result in enumerate(packing_results):
+            if not result['success']:
+                continue
+                
+            color = colors[i % len(colors)]
+            sol_segments = []
+            for a, b in result['sol_edges']:
+                if a in pos and b in pos:
+                    sol_segments.append([pos[a], pos[b]])
+            
+            if sol_segments:
+                ax.add_collection(LineCollection(sol_segments, linewidths=3.0, colors=[color], alpha=0.8, label=f"Tree {i+1}"))
+
+        # Draw routing nodes
+        routing_x, routing_y = [], []
+        port_nodes = []
+        for n in graph.keys():
+            if isinstance(n, tuple) and n in pos:
+                routing_x.append(pos[n][0])
+                routing_y.append(pos[n][1])
+            elif n in pos:
+                port_nodes.append(n)
+        ax.scatter(routing_x, routing_y, s=6)
+
+        # Draw ports
+        marker_map = {"X": "o", "Z": "s", "M": "^"}
+        color_map = {"X": "red", "Z": "blue", "M": "yellow"}
+        for n in port_nodes:
+            x, y = pos[n]
+            t = n.split(":")[-1]
+            ax.scatter([x], [y], marker=marker_map.get(t, "o"), s=85,
+                       c=color_map.get(t, "k"), edgecolors="k", linewidths=0.6)
+
+        # Circle terminals with different styles per set
+        for i, result in enumerate(packing_results):
+            color = colors[i % len(colors)]
+            for tnode in result['terminal_set']:
+                if tnode in pos:
+                    x, y = pos[tnode]
+                    ax.scatter([x], [y], s=200, facecolors="none", 
+                             edgecolors=color, linewidths=2.5, alpha=0.8)
+
+        # Add legend if multiple trees
+        if len([r for r in packing_results if r['success']]) > 1:
+            ax.legend(loc='upper right')
+
+        ax.set_title(title)
+        ax.set_xlim(0, self.W)
+        ax.set_ylim(0, self.H)
+        ax.set_aspect("equal")
+        ax.invert_yaxis()
+        ax.set_xticks(range(0, self.W + 1))
+        ax.set_yticks(range(0, self.H + 1))
+        plt.show()
+
     def _induced_subgraph(self, graph, pos, keep_nodes):
         """
         Return graph/pos restricted to keep_nodes.

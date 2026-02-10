@@ -26,7 +26,7 @@ detailed_logger.propagate = False
 
 
 def start_pipeline(circuit, lattice_layout=None, is_PCB=False, is_CliffordT=False, 
-                  layout_rows=4, layout_cols=4, visualize_steps=False):
+                  layout_rows=4, layout_cols=4, visualize_steps=False, mode="steiner_packing"):
     """
     Complete pipeline: convert circuit -> create DAG -> process with Steiner algorithm.
     
@@ -38,6 +38,7 @@ def start_pipeline(circuit, lattice_layout=None, is_PCB=False, is_CliffordT=Fals
         layout_rows (int): Number of rows in lattice layout
         layout_cols (int): Number of columns in lattice layout
         visualize_steps (bool): Whether to visualize each processing step
+        mode (str): Processing mode - "steiner_tree" (sequential) or "steiner_packing" (parallel)
         
     Returns:
         tuple: (DAGProcessor instance, processing results, final DAG)
@@ -64,11 +65,11 @@ def start_pipeline(circuit, lattice_layout=None, is_PCB=False, is_CliffordT=Fals
     detailed_logger.info(f"DAG qubits: {dag.num_qubits()}")
 
     # Step 3: Process DAG with Steiner algorithm
-    detailed_logger.info(f"Step 3: Processing DAG with Steiner algorithm")
+    detailed_logger.info(f"Step 3: Processing DAG with Steiner algorithm (mode: {mode})")
     detailed_logger.info(f"Using {layout_rows}x{layout_cols} lattice layout")
     processor, results = process_dag_with_steiner(
         dag, layout_rows=layout_rows, layout_cols=layout_cols, 
-        visualize_steps=visualize_steps
+        visualize_steps=visualize_steps, mode=mode
     )
 
     logger.info("Pipeline completed successfully")
@@ -79,7 +80,7 @@ def start_pipeline(circuit, lattice_layout=None, is_PCB=False, is_CliffordT=Fals
 if __name__ == "__main__":
     # Create a test circuit
     print("Creating test quantum circuit...")
-    qc = create_random_circuit(num_qubits=5, depth=20, seed=42)
+    qc = create_random_circuit(num_qubits=20, depth=10, seed=42)
     
     # Print circuit information to console
     print(f"\nOriginal Circuit:")
@@ -93,12 +94,14 @@ if __name__ == "__main__":
     logger.info(f"Created circuit with {qc.num_qubits} qubits, depth {qc.depth()}")
     detailed_logger.info(f"Circuit gates breakdown: {qc.count_ops()}")
     
-    # Run the complete pipeline
+    # Run the complete pipeline with Steiner forest (parallel processing)
+    print("\nRunning pipeline with Steiner forest (parallel processing)...")
     processor, results, dag = start_pipeline(
         qc, 
-        layout_rows=4, 
-        layout_cols=4, 
-        visualize_steps=False  # Set to True for step-by-step visualization
+        layout_rows=5, 
+        layout_cols=5, 
+        visualize_steps=True,  # Set to True for step-by-step visualization
+        mode="steiner_packing"  # Use parallel Steiner forest processing
     )
     
     print(f"\nProcessing completed! Processed {len(results)} DAG nodes")
