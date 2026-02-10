@@ -30,6 +30,13 @@ class DAGProcessor:
         self.eng = nxm_ring_layout_single_qubits(layout_rows, layout_cols)
         self.graph, self.ports_by_patch, self.pos, self.patch_used_by_port = self.eng.build_routing_graph()
         
+        # Debug: log position information
+        detailed_logger.info(f"Position dictionary contains {len(self.pos)} entries:")
+        for patch_name, pos in list(self.pos.items())[:10]:  # Show first 10 entries
+            detailed_logger.info(f"  {patch_name}: {pos}")
+        if len(self.pos) > 10:
+            detailed_logger.info(f"  ... and {len(self.pos) - 10} more entries")
+        
         # Track magic state terminals and their usage
         self.magic_terminals = self._get_magic_terminals()
         self.used_magic_terminals = set()
@@ -100,35 +107,178 @@ class DAGProcessor:
                         # Y operation requires both X and Z ports from the same qubit
                         detailed_logger.info(f"Y operation detected for qubit {qubit_index} - adding both X and Z ports")
                         
-                        # Add X port
-                        if 'X' in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name]['X']:
-                            x_terminal = self.ports_by_patch[patch_name]['X'][0]
-                            terminals.append(x_terminal)
-                            detailed_logger.info(f"Added X terminal {x_terminal} for Y operation on qubit {qubit_index}")
+                        # Get the best oriented ports for both X and Z
+                        magic_terminal = self._choose_magic_terminal()  # Get current magic state position
+                        best_x_port = self._get_best_oriented_port(patch_name, 'X', magic_terminal)
+                        best_z_port = self._get_best_oriented_port(patch_name, 'Z', magic_terminal)
+                        
+                        if best_x_port:
+                            terminals.append(best_x_port)
+                            detailed_logger.info(f"Added oriented X terminal {best_x_port} for Y operation on qubit {qubit_index}")
                         else:
                             logger.warning(f"No X ports available for Y operation on patch {patch_name}")
                         
-                        # Add Z port
-                        if 'Z' in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name]['Z']:
-                            z_terminal = self.ports_by_patch[patch_name]['Z'][0]
-                            terminals.append(z_terminal)
-                            detailed_logger.info(f"Added Z terminal {z_terminal} for Y operation on qubit {qubit_index}")
+                        if best_z_port:
+                            terminals.append(best_z_port)
+                            detailed_logger.info(f"Added oriented Z terminal {best_z_port} for Y operation on qubit {qubit_index}")
                         else:
                             logger.warning(f"No Z ports available for Y operation on patch {patch_name}")
                     
                     else:
-                        # Single port type (X or Z)
-                        if port_type in self.ports_by_patch[patch_name] and self.ports_by_patch[patch_name][port_type]:
-                            # Use the first available port of this type
-                            terminal = self.ports_by_patch[patch_name][port_type][0]
-                            terminals.append(terminal)
-                            detailed_logger.info(f"Added terminal {terminal} for qubit {qubit_index} (port type: {port_type})")
+                        # Single port type (X or Z) - choose best oriented port
+                        magic_terminal = self._choose_magic_terminal()  # Get current magic state position
+                        best_port = self._get_best_oriented_port(patch_name, port_type, magic_terminal)
+                        
+                        if best_port:
+                            terminals.append(best_port)
+                            detailed_logger.info(f"Added oriented terminal {best_port} for qubit {qubit_index} (port type: {port_type})")
                         else:
                             logger.warning(f"No {port_type} ports available for patch {patch_name}")
                 else:
                     logger.warning(f"Patch {patch_name} not found in layout")
         
         return terminals
+    
+    def _get_best_oriented_port(self, data_patch_name, port_type, magic_terminal):
+        """
+        Get the best oriented port on a data patch based on magic state position.
+        
+        Args:
+            data_patch_name (str): Name of the data patch (e.g., 'q_0_1')
+            port_type (str): Type of port needed ('X', 'Z', 'Y')
+            magic_terminal: The magic state terminal being used
+            
+        Returns:
+            str: The best oriented terminal, or None if not available
+        """
+        if data_patch_name not in self.ports_by_patch:
+            return None
+            
+        if port_type not in self.ports_by_patch[data_patch_name]:
+            return None
+            
+        available_ports = self.ports_by_patch[data_patch_name][port_type]
+        if not available_ports:
+            return None
+        
+        # If only one port available, return it
+        if len(available_ports) == 1:
+            return available_ports[0]
+        
+        # Get positions of magic state and data patch
+        magic_patch_name = self._extract_patch_name_from_terminal(magic_terminal)
+        
+        # Find positions by looking up any port from these patches
+        magic_pos = self._get_patch_position(magic_terminal)
+        data_pos = self._get_patch_position_from_name(data_patch_name)
+        
+        if magic_pos is None or data_pos is None:
+            # Fallback: return first available port
+            detailed_logger.warning(f"Could not determine positions for magic terminal {magic_terminal} or data patch {data_patch_name}")
+            return available_ports[0]
+        
+        # Calculate relative direction from data patch to magic patch
+        dx = magic_pos[0] - data_pos[0]  # x-difference (negative = magic is left, positive = magic is right)
+        dy = magic_pos[1] - data_pos[1]  # y-difference (negative = magic is below, positive = magic is above)
+        
+        detailed_logger.info(f"Magic at {magic_pos}, Data at {data_pos}, Delta: ({dx}, {dy})")
+        
+        # Determine preferred port directions based on magic state quadrant
+        preferred_directions = []
+        
+        if dx < 0 and dy > 0:  # Magic is top-left
+            preferred_directions = ['N', 'W']  # North or West ports
+        elif dx > 0 and dy > 0:  # Magic is top-right  
+            preferred_directions = ['N', 'E']  # North or East ports
+        elif dx < 0 and dy < 0:  # Magic is bottom-left
+            preferred_directions = ['S', 'W']  # South or West ports
+        elif dx > 0 and dy < 0:  # Magic is bottom-right
+            preferred_directions = ['S', 'E']  # South or East ports
+        elif dx == 0 and dy > 0:  # Magic is directly above
+            preferred_directions = ['N']
+        elif dx == 0 and dy < 0:  # Magic is directly below
+            preferred_directions = ['S'] 
+        elif dx < 0 and dy == 0:  # Magic is directly left
+            preferred_directions = ['W']
+        elif dx > 0 and dy == 0:  # Magic is directly right
+            preferred_directions = ['E']
+        else:  # Same position (shouldn't happen)
+            preferred_directions = ['N', 'S', 'E', 'W']
+        
+        detailed_logger.info(f"Preferred port directions: {preferred_directions}")
+        
+        # Look for ports in preferred directions
+        for direction in preferred_directions:
+            for port in available_ports:
+                if self._port_has_direction(port, direction):
+                    detailed_logger.info(f"Selected {direction} oriented port: {port}")
+                    return port
+        
+        # Fallback: return first available port
+        detailed_logger.info(f"No preferred direction found, using first available: {available_ports[0]}")
+        return available_ports[0]
+    
+    def _extract_patch_name_from_terminal(self, terminal):
+        """Extract patch name from terminal string like 'P:mT1:M_S:M'."""
+        if isinstance(terminal, str) and ':' in terminal:
+            parts = terminal.split(':')
+            if len(parts) >= 2:
+                return parts[1]  # Extract patch name
+        return str(terminal)  # Fallback
+    
+    def _port_has_direction(self, port_terminal, direction):
+        """
+        Check if a port terminal has a specific direction (N/S/E/W).
+        
+        Args:
+            port_terminal (str): Terminal string like 'P:q_0_0:N:X'
+            direction (str): Direction to check ('N', 'S', 'E', 'W')
+            
+        Returns:
+            bool: True if port has the specified direction
+        """
+        if isinstance(port_terminal, str) and ':' in port_terminal:
+            parts = port_terminal.split(':')
+            if len(parts) >= 3:
+                port_direction = parts[2]  # Extract direction part
+                return direction in port_direction
+        return False
+    
+    def _get_patch_position(self, terminal):
+        """
+        Get the position of a patch from a terminal.
+        
+        Args:
+            terminal: Terminal string (e.g., 'P:mT1:M_S:M')
+            
+        Returns:
+            Position tuple (x, y) or None if not found
+        """
+        if terminal in self.pos:
+            return self.pos[terminal]
+        return None
+    
+    def _get_patch_position_from_name(self, patch_name):
+        """
+        Get the position of a data patch by finding any port from that patch.
+        
+        Args:
+            patch_name: Name of the patch (e.g., 'q_0_0')
+            
+        Returns:
+            Position tuple (x, y) or None if not found
+        """
+        if patch_name in self.ports_by_patch:
+            # Get any port from this patch and look up its position
+            for port_type, ports in self.ports_by_patch[patch_name].items():
+                if ports:
+                    first_port = ports[0]
+                    if first_port in self.pos:
+                        detailed_logger.info(f"Found position for patch {patch_name} via port {first_port}: {self.pos[first_port]}")
+                        return self.pos[first_port]
+        
+        detailed_logger.warning(f"Could not find position for patch {patch_name}")
+        return None
     
     def _get_port_type_for_pauli_gate(self, node, qubit_index, all_qubits_in_operation):
         """
@@ -254,14 +404,18 @@ class DAGProcessor:
         Returns:
             dict: Processing results including terminals and Steiner solution
         """
-        # Get qubit terminals for this node
-        qubit_terminals = self._get_qubit_terminals(dag, node)
-        
-        # Choose a magic state terminal
+        # Choose a magic state terminal first
         magic_terminal = self._choose_magic_terminal()
         
         if magic_terminal is None:
             logger.warning(f"Skipping node {node.op.name} - no magic terminals available")
+            return None
+        
+        # Get qubit terminals for this node (now with directional selection)
+        qubit_terminals = self._get_qubit_terminals_with_magic_direction(dag, node, magic_terminal)
+        
+        if len(qubit_terminals) == 0:
+            logger.warning(f"No qubit terminals found for node {node.op.name}")
             return None
         
         # Combine all terminals
@@ -292,6 +446,73 @@ class DAGProcessor:
         except Exception as e:
             logger.error(f"Error processing node {node.op.name}: {e}")
             return None
+    
+    def _get_qubit_terminals_with_magic_direction(self, dag, node, magic_terminal):
+        """
+        Get the data qubit terminals for a given DAG node with directional selection based on magic state position.
+        
+        Args:
+            dag: The DAG circuit
+            node: The DAG node to process
+            magic_terminal: The chosen magic state terminal
+            
+        Returns:
+            List of data qubit terminals
+        """
+        terminals = []
+        
+        if node.qargs:
+            qubit_indices = [dag.find_bit(q).index for q in node.qargs]
+            detailed_logger.info(f"Node {node.op.name} acts on qubits: {qubit_indices}")
+            
+            # For Pauli evolution gates, we need terminals for each qubit the gate acts on
+            for qubit_index in qubit_indices:
+                # Map qubit index to layout patch
+                # Simple mapping: q_0 -> q_0_0, q_1 -> q_0_1, q_2 -> q_1_0, etc.
+                # This assumes a row-major layout where qubits are arranged in rows
+                row = qubit_index // self.layout_cols
+                col = qubit_index % self.layout_cols
+                patch_name = f"q_{row}_{col}"
+                
+                detailed_logger.info(f"Mapping qubit {qubit_index} to patch {patch_name}")
+                
+                if patch_name in self.ports_by_patch:
+                    # Get the appropriate port type based on the Pauli operation
+                    port_type = self._get_port_type_for_pauli_gate(node, qubit_index, qubit_indices)
+                    
+                    if port_type == 'Y':
+                        # Y operation requires both X and Z ports from the same qubit
+                        detailed_logger.info(f"Y operation detected for qubit {qubit_index} - adding both X and Z ports")
+                        
+                        # Get the best oriented ports for both X and Z
+                        best_x_port = self._get_best_oriented_port(patch_name, 'X', magic_terminal)
+                        best_z_port = self._get_best_oriented_port(patch_name, 'Z', magic_terminal)
+                        
+                        if best_x_port:
+                            terminals.append(best_x_port)
+                            detailed_logger.info(f"Added oriented X terminal {best_x_port} for Y operation on qubit {qubit_index}")
+                        else:
+                            logger.warning(f"No X ports available for Y operation on patch {patch_name}")
+                        
+                        if best_z_port:
+                            terminals.append(best_z_port)
+                            detailed_logger.info(f"Added oriented Z terminal {best_z_port} for Y operation on qubit {qubit_index}")
+                        else:
+                            logger.warning(f"No Z ports available for Y operation on patch {patch_name}")
+                    
+                    else:
+                        # Single port type (X or Z) - choose best oriented port
+                        best_port = self._get_best_oriented_port(patch_name, port_type, magic_terminal)
+                        
+                        if best_port:
+                            terminals.append(best_port)
+                            detailed_logger.info(f"Added oriented terminal {best_port} for qubit {qubit_index} (port type: {port_type})")
+                        else:
+                            logger.warning(f"No {port_type} ports available for patch {patch_name}")
+                else:
+                    logger.warning(f"Patch {patch_name} not found in layout")
+        
+        return terminals
     
     def process_entire_dag(self, dag, visualize_each_step=False):
         """
