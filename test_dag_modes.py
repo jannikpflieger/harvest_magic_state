@@ -27,7 +27,7 @@ def test_both_processing_modes():
     print("\nCreating test DAG with Pauli evolution operations...")
     
     # Create a random circuit and convert to PCB format
-    circuit = create_random_circuit(num_qubits=9, depth=5)
+    circuit = create_random_circuit(num_qubits=9, depth=10)
     pcb_circuit = convert_to_PCB(circuit)
     print(pcb_circuit)
     dag = create_dag(pcb_circuit)
@@ -36,7 +36,7 @@ def test_both_processing_modes():
     print(f"Test DAG has {num_nodes} operation nodes")
     
     # Visualize the DAG structure
-    visualize_dag(dag, "Test DAG Structure")
+    #visualize_dag(dag, "Test DAG Structure")
     
     
     processor1, results1 = process_dag_with_steiner(
@@ -46,7 +46,7 @@ def test_both_processing_modes():
         mode="steiner_tree"
     )
     
-    print(processor1.get_summary("steiner_tree"))
+    #print(processor1.get_summary("steiner_tree"))
     
     # Test Mode 2: Parallel Steiner Packing Processing  
     print("\n" + "="*50)
@@ -63,7 +63,7 @@ def test_both_processing_modes():
     )
     
     print("\nPacking Processing Results:")
-    print(processor2.get_summary("steiner_packing"))
+    #print(processor2.get_summary("steiner_packing"))
     
     return processor1, results1, processor2, results2
 
