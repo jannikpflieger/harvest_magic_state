@@ -708,7 +708,7 @@ class DAGProcessor:
         return all_results
     
     def _get_ready_nodes(self, dag, all_op_nodes, processed_nodes):
-        """Get all nodes ready for execution (no unprocessed dependencies)."""
+        """Get all nodes ready for execution."""
         ready_nodes = []
         for node in all_op_nodes:
             if node in processed_nodes:
