@@ -1,5 +1,10 @@
 import matplotlib.pyplot as plt
 import networkx as nx
+import json
+import os
+import glob
+import numpy as np
+from pathlib import Path
 
 
 def visualize_dag(dag, title="Circuit DAG"):
@@ -146,3 +151,158 @@ def visualize_dag(dag, title="Circuit DAG"):
     plt.show()
     
     return dag
+
+
+def calculate_moving_window_stats(data, window_size=100):
+    """
+    Calculate moving window statistics for the data.
+    
+    Args:
+        data: Array-like data
+        window_size: Size of the moving window
+        
+    Returns:
+        (moving_max, moving_avg): Arrays of moving window maximum and average
+    """
+    data = np.array(data)
+    n = len(data)
+    
+    if n == 0:
+        return np.array([]), np.array([])
+    
+    # If we have fewer data points than window size, use the available data
+    effective_window = min(window_size, n)
+    
+    moving_max = []
+    moving_avg = []
+    
+    for i in range(n):
+        # Define window bounds
+        start_idx = max(0, i - effective_window + 1)
+        end_idx = i + 1
+        
+        window_data = data[start_idx:end_idx]
+        moving_max.append(np.max(window_data))
+        moving_avg.append(np.mean(window_data))
+    
+    return np.array(moving_max), np.array(moving_avg)
+
+
+def load_single_circuit_data(json_file):
+    """
+    Load circuit analysis data from a single JSON file.
+    
+    Args:
+        json_file: Path to circuit analysis JSON file
+        
+    Returns:
+        Dictionary with layer-wise metrics
+    """
+    try:
+        with open(json_file, 'r') as f:
+            content = json.load(f)
+            circuit_data = content.get('circuit', {})
+            
+            if circuit_data.get('analysis_status') != 'SUCCESS':
+                print(f"Circuit analysis was not successful: {circuit_data.get('error', 'Unknown error')}")
+                return None
+            
+            # Extract layer-wise data
+            pauli_evolutions_per_layer = circuit_data.get('pauli_evolutions_per_layer', [])
+            pauli_evolution_sizes_per_layer = circuit_data.get('pauli_evolution_sizes_per_layer', [])
+            
+            # Calculate layer-wise metrics
+            layer_data = {
+                'circuit_name': circuit_data.get('circuit_name', ''),
+                'num_qubits': circuit_data.get('num_qubits', 0),
+                'num_layers': len(pauli_evolutions_per_layer),
+                'pauli_counts_per_layer': pauli_evolutions_per_layer,
+                'max_pauli_size_per_layer': [],
+                'avg_pauli_size_per_layer': []
+            }
+            
+            # Calculate max and average size per layer
+            for layer_sizes in pauli_evolution_sizes_per_layer:
+                if layer_sizes:  # If there are Pauli evolutions in this layer
+                    layer_data['max_pauli_size_per_layer'].append(max(layer_sizes))
+                    layer_data['avg_pauli_size_per_layer'].append(sum(layer_sizes) / len(layer_sizes))
+                else:  # No Pauli evolutions in this layer
+                    layer_data['max_pauli_size_per_layer'].append(0)
+                    layer_data['avg_pauli_size_per_layer'].append(0)
+            
+            return layer_data
+            
+    except Exception as e:
+        print(f"Error loading {json_file}: {e}")
+        return None
+
+
+def visualize_circuit_information(json_file, window_size=500, save_file=None):
+    """
+    Visualize single circuit analysis with 4 metrics over layers using moving windows.
+    
+    Args:
+        json_file: Path to circuit analysis JSON file
+        window_size: Size of moving window for calculations (default: 100)
+        save_file: Optional file path to save the plot
+    """
+    # Load single circuit data
+    data = load_single_circuit_data(json_file)
+    
+    if data is None:
+        print("Failed to load circuit data!")
+        return
+    
+    print(f"Loaded circuit: {data['circuit_name']}")
+    print(f"Qubits: {data['num_qubits']}, Layers: {data['num_layers']}")
+    
+    # Calculate moving window statistics for each metric
+    layers = range(data['num_layers'])
+    
+    # 1. Maximum size of Pauli evolutions (moving window maximum)
+    max_size_max, max_size_avg = calculate_moving_window_stats(data['max_pauli_size_per_layer'], window_size)
+    
+    # 2. Average size of Pauli evolutions (moving window average)
+    avg_size_max, avg_size_avg = calculate_moving_window_stats(data['avg_pauli_size_per_layer'], window_size)
+    
+    # 3. Maximum number of Pauli evolutions (moving window maximum)
+    max_count_max, max_count_avg = calculate_moving_window_stats(data['pauli_counts_per_layer'], window_size)
+    
+    # 4. Average number of Pauli evolutions (moving window average) 
+    avg_count_max, avg_count_avg = calculate_moving_window_stats(data['pauli_counts_per_layer'], window_size)
+    
+    # Create single plot with 4 lines
+    plt.figure(figsize=(15, 8))
+    
+    # Plot the 4 metrics
+    plt.plot(layers, max_size_max, 'b-', linewidth=2, label='Max Pauli Size (Moving Max)', alpha=0.8)
+    plt.plot(layers, avg_size_avg, 'g-', linewidth=2, label='Avg Pauli Size (Moving Avg)', alpha=0.8)
+    plt.plot(layers, max_count_max, 'r-', linewidth=2, label='Max Pauli Count (Moving Max)', alpha=0.8)
+    plt.plot(layers, avg_count_avg, 'm-', linewidth=2, label='Avg Pauli Count (Moving Avg)', alpha=0.8)
+    
+    plt.title(f'Pauli Evolution Metrics - {data["circuit_name"]} ({data["num_qubits"]} qubits)\n'
+              f'Moving Window Size: {window_size}', fontsize=14, fontweight='bold')
+    plt.xlabel('Layer Index', fontsize=12)
+    plt.ylabel('Value', fontsize=12)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save plot if file path provided
+    if save_file:
+        plt.savefig(save_file, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to: {save_file}")
+    
+    plt.show()
+    
+    # Print summary statistics
+    print(f"\n{'='*60}")
+    print("CIRCUIT LAYER ANALYSIS SUMMARY")
+    print(f"{'='*60}")
+    print(f"Circuit: {data['circuit_name']} ({data['num_qubits']} qubits)")
+    print(f"Total Layers: {data['num_layers']}")
+    print(f"Max Pauli Size across all layers: {max(data['max_pauli_size_per_layer'])}")
+    print(f"Avg Pauli Size range: {min(data['avg_pauli_size_per_layer']):.3f} - {max(data['avg_pauli_size_per_layer']):.3f}")
+    print(f"Max Pauli Count in any layer: {max(data['pauli_counts_per_layer'])}")
+    print(f"Avg Pauli Count per layer: {sum(data['pauli_counts_per_layer'])/len(data['pauli_counts_per_layer']):.2f}")
+    print(f"{'='*60}")
