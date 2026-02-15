@@ -1,0 +1,2 @@
+from visualizer import visualize_circuit_information
+visualize_circuit_information('circuit/benchmark_circuits/circuit_analysis_results/circuit_benchmark_circuits_qasm_qaoa_qaoa_barabasi_albert_N30_3reps.json',window_size=5, save_file='qaoa_barabasi_albert_N30_3reps_w100.png')

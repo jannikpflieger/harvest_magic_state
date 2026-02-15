@@ -9,6 +9,25 @@ import random
 import mqt.bench as mqtbench
 from mqt.bench import get_benchmark, BenchmarkLevel, targets
 
+def qasm_to_circuit(filename):
+    """
+    Load a quantum circuit from a QASM file.
+    
+    Args:
+        filename: Path to the QASM file
+    Returns:
+        QuantumCircuit: The loaded quantum circuit
+    """
+    try:
+        circuit = QuantumCircuit.from_qasm_file(filename)
+        print(f"Successfully loaded circuit from {filename}")
+        print(f"Gates: {dict(circuit.count_ops())}")
+        print(f"Depth: {circuit.depth()}")
+        print(f"Qubits: {circuit.num_qubits}")
+        return circuit
+    except Exception as e:
+        print(f"Error loading QASM file: {e}")
+        raise
 
 def convert_to_PCB(circuit, fix_clifford=False, verbose=True):
     """
@@ -79,9 +98,6 @@ def convert_to_PCB(circuit, fix_clifford=False, verbose=True):
         print(f"=== End PBC Conversion ===\n")
     
     return pcb_circuit
-
-def convert_to_CliffordT(circuit):
-    pass
 
 def create_random_circuit(num_qubits, depth, seed=None):
     """
