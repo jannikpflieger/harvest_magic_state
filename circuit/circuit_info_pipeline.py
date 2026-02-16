@@ -3,12 +3,12 @@ import glob
 import json
 import statistics
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 import time
 from circuit_to_pbc_dag import qasm_to_circuit, convert_to_PCB, create_dag
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.transpiler import PassManager
-from qiskit.transpiler.passes import BasisTranslator, RemoveFinalMeasurements
+from qiskit.transpiler.passes import RemoveFinalMeasurements, RemoveBarriers
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
 from qiskit import QuantumCircuit
 
@@ -16,7 +16,6 @@ from bqskit.ft import CliffordTModel
 from bqskit import compile
 from bqskit.ir.circuit import Circuit
 from bqskit.ext import qiskit_to_bqskit, bqskit_to_qiskit
-from bqskit.passes import ScanningGateRemovalPass
 
 
 def is_identity_op(op) -> bool:
@@ -70,7 +69,6 @@ def find_qasm_files(base_dir: str) -> List[str]:
     print(f"Found {len(qasm_files)} QASM files in {base_dir}")
     return sorted(qasm_files)
 
-
 def convert_rx_ry_to_rz(circuit):
     """
     Convert rx and ry gates to rz gates using basis translation.
@@ -100,7 +98,6 @@ def convert_rx_ry_to_rz(circuit):
     
     return converted_circuit
 
-
 def has_unsupported_gates(circuit) -> Tuple[bool, List[str]]:
     """
     Check if circuit has gates that are unsupported by the PCB conversion.
@@ -127,7 +124,6 @@ def has_unsupported_gates(circuit) -> Tuple[bool, List[str]]:
     
     return len(unsupported_gates) > 0, unsupported_gates
 
-
 def count_non_clifford_gates(circuit) -> int:
     """
     Count the number of non-Clifford gates in a circuit.
@@ -151,7 +147,6 @@ def count_non_clifford_gates(circuit) -> int:
             non_clifford_count += count
     
     return non_clifford_count
-
 
 def analyze_dag_layers(dag: DAGCircuit) -> Dict:
     """
@@ -212,7 +207,6 @@ def analyze_dag_layers(dag: DAGCircuit) -> Dict:
         'avg_pauli_evolution_size': avg_pauli_evolution_size
     }
 
-
 def save_individual_circuit_json(circuit_data: Dict, output_dir: str) -> str:
     """
     Save individual circuit analysis to JSON file.
@@ -241,7 +235,6 @@ def save_individual_circuit_json(circuit_data: Dict, output_dir: str) -> str:
         json.dump(json_data, f, indent=2, sort_keys=True)
     
     return json_path
-
 
 def analyze_single_circuit(qasm_file: str, output_dir: str = None) -> Dict:
     """
@@ -411,10 +404,19 @@ def analyze_single_circuit(qasm_file: str, output_dir: str = None) -> Dict:
             'dag_analysis_successful': False
         }
 
+def pre_prep_circuit(circuit):
+    # Remove measurements and barriers before analysis
+    pm = PassManager()
+    pm.append(RemoveFinalMeasurements())
+    pm.append(RemoveBarriers())  # Remove barriers to avoid issues with gate checking
+    # Remove barrier gates as they're not needed for gate checking
+    circuit = pm.run(circuit)
+
+    return circuit
 
 def filter_supported_circuits(qasm_files: List[str]) -> Tuple[List[str], Dict[str, List[str]]]:
     """
-    Filter circuits to only include those with supported gates for PCB conversion and ≤30 qubits.
+    Filter circuits to only include those with supported gates for PCB conversion.
     
     Args:
         qasm_files: List of QASM file paths
@@ -426,23 +428,24 @@ def filter_supported_circuits(qasm_files: List[str]) -> Tuple[List[str], Dict[st
     skipped_circuits = {}
     
     print(f"\n{'='*80}")
-    print(f"Filtering circuits for supported gates and qubit count (≤30)...")
+    print(f"Filtering circuits for supported gates...")
     print(f"{'='*80}")
     
     for qasm_file in qasm_files:
         relative_path = os.path.relpath(qasm_file)
         
         try:
-            # Load circuit quickly to check gates and qubits
+            # Load circuit quickly to check gates
             circuit = qasm_to_circuit(qasm_file)
+            
+            # Preprocess circuit: remove measurements and barriers before checking supported gates
+            circuit = pre_prep_circuit(circuit)
+
             has_unsupported, unsupported_gates = has_unsupported_gates(circuit)
             
             if has_unsupported:
                 skipped_circuits[relative_path] = unsupported_gates
                 print(f"SKIP - {relative_path}: unsupported gates {unsupported_gates}")
-            elif circuit.num_qubits > 30:
-                skipped_circuits[relative_path] = [f"Too many qubits: {circuit.num_qubits} > 30"]
-                print(f"SKIP - {relative_path}: too many qubits ({circuit.num_qubits})")
             else:
                 supported_circuits.append(qasm_file)
                 print(f"✓ OK - {relative_path} ({circuit.num_qubits} qubits)")
@@ -453,7 +456,6 @@ def filter_supported_circuits(qasm_files: List[str]) -> Tuple[List[str], Dict[st
     
     print(f"\nFiltering complete: {len(supported_circuits)} supported, {len(skipped_circuits)} skipped")
     return supported_circuits, skipped_circuits
-
 
 def test_qasm_conversion(qasm_files: List[str], output_dir: str = None) -> Dict[str, Dict]:
     """
@@ -498,7 +500,6 @@ def test_qasm_conversion(qasm_files: List[str], output_dir: str = None) -> Dict[
     print(f"{'='*80}")
     
     return results
-
 
 def analyze_results(results: Dict[str, Dict]) -> None:
     """
@@ -585,7 +586,6 @@ def analyze_results(results: Dict[str, Dict]) -> None:
                     print(f"      - {file}")
                 print(f"      ... and {len(files)-3} more")
 
-
 def run_qasm_pipeline(benchmark_dir: str = None, max_files: int = None, 
                       subdirs: List[str] = None, output_json: str = None, 
                       skip_unsupported: bool = True) -> Dict[str, Dict]:
@@ -655,53 +655,52 @@ def run_qasm_pipeline(benchmark_dir: str = None, max_files: int = None,
     # Perform comprehensive analysis
     results = test_qasm_conversion(qasm_files, results_dir)
     
-    # Generate JSON output filename if not provided
-    if output_json is None:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        if subdirs:
-            subdir_suffix = "_" + "_".join(subdirs)
-        else:
-            subdir_suffix = "_all"
-        output_json = f"qasm_analysis{subdir_suffix}_{timestamp}.json"
-    
-    # Save results to JSON
-    try:
-        # Convert results to a more JSON-friendly format
-        json_results = {
-            'metadata': {
-                'analysis_timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-                'benchmark_directory': benchmark_dir,
-                'subdirectories_analyzed': subdirs,
-                'total_files_found': len(results),
-                'max_files_limit': max_files,
-                'skip_unsupported_enabled': skip_unsupported,
-                'skipped_circuits_count': len(skipped_circuits),
-                'successful_analyses': len([r for r in results.values() if r['analysis_status'] == 'SUCCESS']),
-                'failed_analyses': len([r for r in results.values() if r['analysis_status'] == 'FAILED']),
-                'individual_json_directory': results_dir
-            },
-            'skipped_circuits': skipped_circuits,
-            'circuits': {}
-        }
+    # Save consolidated JSON only if not using subdirs (when subdirs is used, individual JSONs are preferred)
+    if not subdirs:
+        # Generate JSON output filename if not provided
+        if output_json is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_json = f"qasm_analysis_all_{timestamp}.json"
         
-        # Convert file paths to relative paths for cleaner JSON
-        for file_path, result in results.items():
-            relative_path = os.path.relpath(file_path)
-            json_results['circuits'][relative_path] = result
-        
-        with open(output_json, 'w') as f:
-            json.dump(json_results, f, indent=2, sort_keys=True)
-        
-        print(f"\nResults saved to: {output_json}")
-        
-    except Exception as e:
-        print(f"Warning: Failed to save JSON results: {e}")
+        # Save results to JSON
+        try:
+            # Convert results to a more JSON-friendly format
+            json_results = {
+                'metadata': {
+                    'analysis_timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                    'benchmark_directory': benchmark_dir,
+                    'total_files_found': len(results),
+                    'max_files_limit': max_files,
+                    'skip_unsupported_enabled': skip_unsupported,
+                    'skipped_circuits_count': len(skipped_circuits),
+                    'successful_analyses': len([r for r in results.values() if r['analysis_status'] == 'SUCCESS']),
+                    'failed_analyses': len([r for r in results.values() if r['analysis_status'] == 'FAILED']),
+                    'individual_json_directory': results_dir
+                },
+                'skipped_circuits': skipped_circuits,
+                'circuits': {}
+            }
+            
+            # Convert file paths to relative paths for cleaner JSON
+            for file_path, result in results.items():
+                relative_path = os.path.relpath(file_path)
+                json_results['circuits'][relative_path] = result
+            
+            with open(output_json, 'w') as f:
+                json.dump(json_results, f, indent=2, sort_keys=True)
+            
+            print(f"\nConsolidated results saved to: {output_json}")
+            
+        except Exception as e:
+            print(f"Warning: Failed to save JSON results: {e}")
+    else:
+        print(f"\nWhen using subdirs, individual JSON files are saved to: {results_dir}")
+        print(f"No consolidated JSON file created (individual JSONs preferred for subdir analysis)")
     
     # Analyze and display results
     analyze_results(results)
     
     return results
-
 
 if __name__ == "__main__":
     import argparse

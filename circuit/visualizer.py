@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for saving plots without GUI
 import matplotlib.pyplot as plt
 import networkx as nx
 import json
@@ -237,14 +239,39 @@ def load_single_circuit_data(json_file):
         return None
 
 
-def visualize_circuit_information(json_file, window_size=500, save_file=None):
+def calculate_optimal_window_size(num_layers):
+    """
+    Calculate appropriate window size based on number of layers.
+    
+    Args:
+        num_layers: Number of layers in the circuit
+        
+    Returns:
+        Optimal window size for the circuit
+    """
+    if num_layers >= 10000:
+        return 100
+    elif num_layers >= 5000:
+        return 50  
+    elif num_layers >= 1000:
+        return 10
+    elif num_layers >= 500:
+        return 5
+    elif num_layers >= 100:
+        return 3
+    else:
+        return max(1, num_layers // 10)
+
+
+def visualize_circuit_information(json_file, window_size=None, save_file=None, show_plot=False):
     """
     Visualize single circuit analysis with 4 metrics over layers using moving windows.
     
     Args:
         json_file: Path to circuit analysis JSON file
-        window_size: Size of moving window for calculations (default: 100)
+        window_size: Size of moving window for calculations (if None, auto-calculate based on layers)
         save_file: Optional file path to save the plot
+        show_plot: Whether to display the plot (default: False)
     """
     # Load single circuit data
     data = load_single_circuit_data(json_file)
@@ -253,8 +280,12 @@ def visualize_circuit_information(json_file, window_size=500, save_file=None):
         print("Failed to load circuit data!")
         return
     
+    # Auto-calculate window size if not provided
+    if window_size is None:
+        window_size = calculate_optimal_window_size(data['num_layers'])
+    
     print(f"Loaded circuit: {data['circuit_name']}")
-    print(f"Qubits: {data['num_qubits']}, Layers: {data['num_layers']}")
+    print(f"Qubits: {data['num_qubits']}, Layers: {data['num_layers']}, Window Size: {window_size}")
     
     # Calculate moving window statistics for each metric
     layers = range(data['num_layers'])
@@ -292,17 +323,79 @@ def visualize_circuit_information(json_file, window_size=500, save_file=None):
     if save_file:
         plt.savefig(save_file, dpi=300, bbox_inches='tight')
         print(f"Plot saved to: {save_file}")
+        plt.close()  # Close the figure to free memory
     
-    plt.show()
+    # Only show plot if explicitly requested
+    if show_plot:
+        plt.show()
+    elif save_file:
+        plt.close()  # Close if not showing
     
     # Print summary statistics
-    print(f"\n{'='*60}")
-    print("CIRCUIT LAYER ANALYSIS SUMMARY")
-    print(f"{'='*60}")
     print(f"Circuit: {data['circuit_name']} ({data['num_qubits']} qubits)")
     print(f"Total Layers: {data['num_layers']}")
     print(f"Max Pauli Size across all layers: {max(data['max_pauli_size_per_layer'])}")
-    print(f"Avg Pauli Size range: {min(data['avg_pauli_size_per_layer']):.3f} - {max(data['avg_pauli_size_per_layer']):.3f}")
     print(f"Max Pauli Count in any layer: {max(data['pauli_counts_per_layer'])}")
-    print(f"Avg Pauli Count per layer: {sum(data['pauli_counts_per_layer'])/len(data['pauli_counts_per_layer']):.2f}")
     print(f"{'='*60}")
+
+
+def process_all_circuit_analyses(results_dir="benchmark_circuits/circuit_analysis_results/", plots_dir="../plots/"):
+    """
+    Process all JSON files in the circuit analysis results directory and generate plots.
+    
+    Args:
+        results_dir: Directory containing JSON analysis files
+        plots_dir: Directory to save the generated plots
+    """
+    # Create plots directory if it doesn't exist
+    plots_path = Path(plots_dir)
+    plots_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get all JSON files in the results directory
+    results_path = Path(results_dir)
+    json_files = list(results_path.glob("*.json"))
+    
+    print(f"Found {len(json_files)} JSON files to process")
+    print(f"Saving plots to: {plots_path.absolute()}")
+    
+    successful_plots = 0
+    failed_plots = 0
+    
+    for json_file in json_files:
+        try:
+            # Generate output filename
+            plot_filename = f"{json_file.stem}_analysis.png"
+            save_path = plots_path / plot_filename
+            
+            print(f"\nProcessing: {json_file.name}")
+            
+            # Generate the plot
+            visualize_circuit_information(
+                str(json_file), 
+                window_size=None,  # Auto-calculate
+                save_file=str(save_path), 
+                show_plot=False  # Don't display
+            )
+            
+            successful_plots += 1
+            
+        except Exception as e:
+            print(f"Error processing {json_file.name}: {e}")
+            failed_plots += 1
+    
+    print(f"\n{'='*60}")
+    print("BATCH PROCESSING SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total files processed: {len(json_files)}")
+    print(f"Successful plots: {successful_plots}")
+    print(f"Failed plots: {failed_plots}")
+    print(f"Plots saved to: {plots_path.absolute()}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    # Process all circuit analysis JSON files
+    process_all_circuit_analyses(
+        results_dir="benchmark_circuits/circuit_analysis_results/",
+        plots_dir="../plots/"
+    )
