@@ -579,7 +579,7 @@ class DAGProcessor:
         Args:
             dag: The DAG circuit to process
             visualize_each_step (bool): Whether to visualize each Steiner solution
-            mode (str): Processing mode - "steiner_tree" or "steiner_packing"
+            mode (str): Processing mode - "steiner_tree", "steiner_packing", or "steiner_pathfinder"
             
         Returns:
             list: Results from processing all nodes
@@ -588,6 +588,8 @@ class DAGProcessor:
             return self._process_dag_sequential(dag, visualize_each_step)
         elif mode == "steiner_packing":
             return self._process_dag_with_packing(dag, visualize_each_step)
+        elif mode == "steiner_pathfinder":
+            return self._process_dag_with_pathfinder(dag, visualize_each_step)
         else:
             raise ValueError(f"Unknown processing mode: {mode}")
     
@@ -707,6 +709,174 @@ class DAGProcessor:
         logger.info(f"Finished packing processing in {time_step} time steps. Processed {len(all_results)}/{num_nodes} nodes successfully.")
         return all_results
     
+    def _process_dag_with_pathfinder(self, dag, visualize_each_step=False):
+        """
+        Process DAG using a pathfinder-based approach.
+        Uses steiner_packing_pathfinder for more advanced pathfinding with iterative improvements.
+        """
+        num_nodes = len(list(dag.op_nodes()))
+        logger.info(f"Starting DAG processing with Steiner pathfinder - {num_nodes} operation nodes")
+        
+        processed_nodes = set()
+        all_results = []
+        time_step = 0
+        all_op_nodes = list(dag.op_nodes())
+        
+        while len(processed_nodes) < len(all_op_nodes):
+            logger.info(f"=== Time Step {time_step} ===")
+            
+            ready_nodes = self._get_ready_nodes(dag, all_op_nodes, processed_nodes)
+            
+            if not ready_nodes:
+                logger.warning("No ready nodes found, breaking to avoid infinite loop")
+                break
+            
+            logger.info(f"Found {len(ready_nodes)} ready nodes: {[n.op.name for n in ready_nodes]}")
+            
+            # Use the full graph for each time step - routing cells can be reused
+            working_graph = self.graph.copy()
+            
+            # Process this time step
+            time_step_results = self._process_time_step_with_pathfinder(
+                dag, ready_nodes, time_step, working_graph, visualize_each_step
+            )
+            
+            # Update tracking
+            successful_nodes = []
+            for result in time_step_results:
+                if result['success']:
+                    processed_nodes.add(result['node'])
+                    all_results.append(result)
+                    successful_nodes.append(result['node'])
+                    # Note: Only magic terminals are permanently used, routing cells can be reused
+            
+            successful_count = len(successful_nodes)
+            failed_count = len(time_step_results) - successful_count
+            
+            logger.info(f"Time step {time_step}: {successful_count} successful, {failed_count} failed")
+            
+            # If no progress, we're stuck
+            if successful_count == 0:
+                logger.warning(f"No progress in time step {time_step}, remaining nodes cannot be routed")
+                break
+                
+            time_step += 1
+            
+            # Safety check
+            if time_step > num_nodes:
+                logger.error("Too many time steps - stopping")
+                break
+        
+        logger.info(f"Finished pathfinder processing in {time_step} time steps. Processed {len(all_results)}/{num_nodes} nodes successfully.")
+        return all_results
+
+    def _process_time_step_with_pathfinder(self, dag, ready_nodes, time_step, working_graph, visualize_each_step):
+        """Process multiple nodes in a single time step using Steiner pathfinder."""
+        if not ready_nodes:
+            return []
+        
+        terminal_sets = []
+        node_to_terminals = {}
+        temp_used_magic = self.used_magic_terminals.copy()
+        
+        for node in ready_nodes:
+            # Get available magic terminals for this time step
+            available_magic = [t for t in self.magic_terminals if t not in temp_used_magic]
+            if not available_magic:
+                logger.warning(f"No magic terminals available for node {node.op.name}")
+                continue
+            
+            # First get potential qubit terminals to find the optimal magic terminal
+            # Try with a dummy magic terminal to get qubit positions
+            dummy_magic = available_magic[0]
+            potential_qubit_terminals = self._get_qubit_terminals_with_magic_direction(dag, node, dummy_magic)
+            if not potential_qubit_terminals:
+                continue
+            
+            # Choose the magic terminal closest to the qubit terminals
+            magic_terminal = self._choose_optimal_magic_terminal(potential_qubit_terminals, available_magic)
+            if not magic_terminal:
+                logger.warning(f"No suitable magic terminal found for node {node.op.name}")
+                continue
+                
+            temp_used_magic.add(magic_terminal)
+            
+            # Get qubit terminals with the chosen optimal magic terminal
+            qubit_terminals = self._get_qubit_terminals_with_magic_direction(dag, node, magic_terminal)
+            if not qubit_terminals:
+                temp_used_magic.remove(magic_terminal)
+                continue
+                
+            # Create terminal set
+            terminals = [magic_terminal] + qubit_terminals
+            terminal_sets.append(terminals)
+            node_to_terminals[node] = {
+                'magic_terminal': magic_terminal,
+                'qubit_terminals': qubit_terminals,
+                'all_terminals': terminals
+            }
+        
+        if len(terminal_sets) == 0:
+            logger.warning(f"No valid terminal sets for time step {time_step}")
+            return []
+        
+        # Run Steiner pathfinder on working graph
+        logger.info(f"Running Steiner pathfinder on {len(terminal_sets)} terminal sets")
+        packing_results, _ = self.eng.steiner_packing_pathfinder(
+            working_graph,
+            terminal_sets,
+            max_iters=15,
+            alpha=6.0,
+            beta=1.5,
+            greedy_order="min_size",
+        )
+        
+        # Process results
+        time_step_results = []
+        nodes_with_terminals = [node for node in ready_nodes if node in node_to_terminals]
+        
+        for i, (node, packing_result) in enumerate(zip(nodes_with_terminals, packing_results)):
+            node_terminals = node_to_terminals[node]
+            
+            result = {
+                'node': node,
+                'gate_name': node.op.name,
+                'qubits': [dag.find_bit(q).index for q in node.qargs] if node.qargs else [],
+                'time_step': time_step,
+                'success': packing_result['success'],
+                'magic_terminal': node_terminals['magic_terminal'],
+                'qubit_terminals': node_terminals['qubit_terminals'],
+                'all_terminals': node_terminals['all_terminals'],
+                'steiner_nodes': packing_result['sol_nodes'] if packing_result['success'] else set(),
+                'steiner_edges': packing_result['sol_edges'] if packing_result['success'] else set()
+            }
+            
+            if packing_result['success']:
+                # Permanently allocate magic terminal
+                self.used_magic_terminals.add(node_terminals['magic_terminal'])
+                logger.info(f"Successfully routed {node.op.name} in time step {time_step}")
+            else:
+                logger.info(f"Failed to route {node.op.name} in time step {time_step}")
+                if 'error' in packing_result:
+                    result['error'] = packing_result['error']
+            
+            time_step_results.append(result)
+        
+        # Visualize if requested
+        if visualize_each_step and time_step_results:
+            successful_results = [r for r in time_step_results if r['success']]
+            if successful_results:
+                self.eng.visualize_packing_solution(
+                    working_graph, self.pos,
+                    [{'terminal_set': r['all_terminals'], 
+                      'sol_nodes': r['steiner_nodes'],
+                      'sol_edges': r['steiner_edges'],
+                      'success': r['success']} for r in successful_results],
+                    title=f"Time Step {time_step} (Pathfinder): {len(successful_results)} nodes routed"
+                )
+        
+        return time_step_results
+
     def _get_ready_nodes(self, dag, all_op_nodes, processed_nodes):
         """Get all nodes ready for execution."""
         ready_nodes = []
@@ -854,8 +1024,8 @@ class DAGProcessor:
         
         summary += f"Used magic terminals: {len(self.used_magic_terminals)}/{len(self.magic_terminals)}\n"
         
-        if mode == "steiner_packing" and self.processing_results:
-            # Add time step analysis for packing mode
+        if mode in ["steiner_packing", "steiner_pathfinder"] and self.processing_results:
+            # Add time step analysis for packing and pathfinder modes
             time_steps = set()
             for result in successful_results:
                 if 'time_step' in result:
@@ -881,7 +1051,7 @@ def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=
         layout_rows (int): Number of rows in lattice layout
         layout_cols (int): Number of columns in lattice layout  
         visualize_steps (bool): Whether to visualize each processing step
-        mode (str): Processing mode - "steiner_tree" for sequential, "steiner_packing" for parallel
+        mode (str): Processing mode - "steiner_tree" (sequential), "steiner_packing" (parallel), or "steiner_pathfinder" (pathfinder-based)
         
     Returns:
         tuple: (DAGProcessor instance, processing results)

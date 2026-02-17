@@ -10,7 +10,6 @@ This package provides functionality for:
 
 from .circuit_to_pbc_dag import (
     convert_to_PCB,
-    convert_to_CliffordT,
     create_random_circuit,
     create_dag,
     mqt_bench_pipeline

@@ -14,6 +14,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union, Set
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from collections import defaultdict, Counter
+import random
+from matplotlib.collections import LineCollection
 
 Coord = Tuple[int, int]
 Node = Union[Coord, str]
@@ -492,6 +495,278 @@ class LayoutEngine:
         
         return results, working_graph
 
+    def steiner_packing_pathfinder(
+        self,
+        graph,
+        terminal_sets,
+        *,
+        max_iters: int = 20,
+        alpha: float = 5.0,
+        beta: float = 1.0,
+        capacity: int = 1,
+        prune_cycles: bool = True,
+        greedy_order: str = "min_size",
+        seed: int | None = None,
+    ):
+        """
+        PathFinder-style negotiated congestion for Steiner forest packing.
+
+        Goal: route as many terminal_sets as possible in the SAME timestep such that
+        routing cells (tuple nodes) are node-disjoint (capacity=1), while allowing
+        port/terminal nodes (non-tuples, typically) to be shared.
+
+        High-level:
+        - Route all nets allowing overlaps
+        - Iteratively rip-up & reroute with congestion + history penalties
+        - If conflicts remain, greedily drop nets until conflict-free
+        - Commit: remove used routing nodes from remaining_graph
+
+        Args:
+            graph: adjacency list {node: [(nbr, w), ...]}
+            terminal_sets: list[list[node]]
+            max_iters: number of negotiated-congestion iterations
+            alpha: weight for PRESENT congestion penalty (discourage currently-used routing cells)
+            beta: weight for HISTORY penalty (discourage repeatedly-congested routing cells)
+            capacity: routing-node capacity (use 1 for node-disjoint routing cells)
+            prune_cycles: forwarded to steiner_tree
+            greedy_order: "min_size", "max_size", or "original" ordering of nets
+            seed: optional RNG seed (affects tie-breaking in drop phase order only)
+
+        Returns:
+            results: list[dict] (same positions as terminal_sets), each dict contains:
+                - terminal_set
+                - sol_nodes
+                - sol_edges
+                - success (True if packed, False otherwise)
+                - error (optional, if failed/dropped)
+            remaining_graph: graph with used routing nodes removed (like your current packer)
+        """
+        if seed is not None:
+            random.seed(seed)
+
+        if not terminal_sets:
+            return [], dict(graph)
+
+        # --- Helpers -------------------------------------------------------------
+
+        def _copy_graph(g):
+            return {u: list(nbrs) for u, nbrs in g.items()}
+
+        def _routing_nodes_used(sol_nodes, terminals):
+            # Routing cells are tuple nodes; terminals/ports may be strings (or something else).
+            # We also exclude terminals themselves from being treated as "blocked routing",
+            # so ports can be shared across nets.
+            tset = set(terminals)
+            return {n for n in sol_nodes if isinstance(n, tuple) and n not in tset}
+
+        def _build_weighted_graph(base_graph, node_cost):
+            """
+            Encode node penalties into edge weights by charging cost on entry to v:
+                w'(u->v) = w(u->v) + node_cost(v)
+            This lets us reuse self.steiner_tree() without rewriting Dijkstra.
+            """
+            wg = {}
+            for u, nbrs in base_graph.items():
+                out = []
+                for v, w in nbrs:
+                    out.append((v, w + node_cost.get(v, 0.0)))
+                wg[u] = out
+            return wg
+
+        def _order_indices(sets):
+            indexed = list(enumerate(sets))
+            if greedy_order == "min_size":
+                indexed.sort(key=lambda x: len(x[1]))
+            elif greedy_order == "max_size":
+                indexed.sort(key=lambda x: len(x[1]), reverse=True)
+            return indexed
+
+        # --- State ---------------------------------------------------------------
+
+        base_graph = _copy_graph(graph)
+        indexed_sets = _order_indices(terminal_sets)
+
+        # Current routed solution per net index
+        routes = [None] * len(terminal_sets)  # dict with sol_nodes/sol_edges/success
+
+        # usage[routing_node] = number of nets currently using it
+        usage = Counter()
+
+        # history penalty accumulator for routing nodes that keep getting congested
+        history = defaultdict(float)
+
+        # --- Initial routing (no congestion penalties yet) ------------------------
+
+        node_cost = {}  # empty => pure geometric/edge weights
+        weighted_graph = _build_weighted_graph(base_graph, node_cost)
+
+        for i, terminals in indexed_sets:
+            try:
+                sol_nodes, sol_edges = self.steiner_tree(weighted_graph, terminals, prune_cycles=prune_cycles)
+                routes[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": sol_nodes,
+                    "sol_edges": sol_edges,
+                    "success": True,
+                }
+                for n in _routing_nodes_used(sol_nodes, terminals):
+                    usage[n] += 1
+            except (ValueError, KeyError) as e:
+                routes[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": set(),
+                    "sol_edges": set(),
+                    "success": False,
+                    "error": str(e),
+                }
+
+        # --- Negotiated congestion iterations ------------------------------------
+
+        def has_conflicts():
+            return any(c > capacity for c in usage.values())
+
+        for _it in range(max_iters):
+            if not has_conflicts():
+                break
+
+            # Reroute nets one-by-one, treating others as "fixed" via usage penalties.
+            # (Classic rip-up & reroute.)
+            for i, terminals in indexed_sets:
+                if not routes[i] or not routes[i].get("success", False):
+                    continue
+
+                # Rip up current route i: remove its contribution from usage
+                old_nodes = routes[i]["sol_nodes"]
+                old_rnodes = _routing_nodes_used(old_nodes, terminals)
+                for n in old_rnodes:
+                    usage[n] -= 1
+                    if usage[n] <= 0:
+                        del usage[n]
+
+                # Build node costs based on current usage + history.
+                # Present congestion: nodes already used are more expensive.
+                # History: nodes that have been congested in past iterations stay expensive.
+                node_cost = {}
+                for n, c in usage.items():
+                    if c > 0:
+                        node_cost[n] = node_cost.get(n, 0.0) + alpha * (c / capacity)
+                for n, h in history.items():
+                    if h > 0.0:
+                        node_cost[n] = node_cost.get(n, 0.0) + beta * h
+
+                weighted_graph = _build_weighted_graph(base_graph, node_cost)
+
+                # Reroute i with updated penalties
+                try:
+                    sol_nodes, sol_edges = self.steiner_tree(weighted_graph, terminals, prune_cycles=prune_cycles)
+                    routes[i] = {
+                        "terminal_set": terminals,
+                        "sol_nodes": sol_nodes,
+                        "sol_edges": sol_edges,
+                        "success": True,
+                    }
+                    for n in _routing_nodes_used(sol_nodes, terminals):
+                        usage[n] += 1
+                except (ValueError, KeyError) as e:
+                    # If reroute fails, mark as failed for now (it won't contribute to usage)
+                    routes[i] = {
+                        "terminal_set": terminals,
+                        "sol_nodes": set(),
+                        "sol_edges": set(),
+                        "success": False,
+                        "error": str(e),
+                    }
+
+            # Update history penalties for nodes still congested after a full pass
+            for n, c in usage.items():
+                if c > capacity:
+                    history[n] += (c - capacity)
+
+        # --- Final conflict resolution: drop nets until capacity respected --------
+
+        def current_overfull_nodes():
+            return {n for n, c in usage.items() if c > capacity}
+
+        overfull = current_overfull_nodes()
+        dropped = set()
+
+        while overfull:
+            # Score each net by how many overfull routing nodes it uses (and break ties by size)
+            best_i = None
+            best_score = (-1, -1)  # (conflict_count, route_size)
+
+            for i, terminals in indexed_sets:
+                if i in dropped:
+                    continue
+                if not routes[i] or not routes[i].get("success", False):
+                    continue
+
+                rnodes = _routing_nodes_used(routes[i]["sol_nodes"], terminals)
+                conflict_count = sum(1 for n in rnodes if n in overfull)
+                route_size = len(rnodes)
+
+                score = (conflict_count, route_size)
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+
+            # If we can't find a net to drop (shouldn't happen), break to avoid infinite loop.
+            if best_i is None or best_score[0] <= 0:
+                break
+
+            # Drop it: remove its usage
+            terminals = routes[best_i]["terminal_set"]
+            rnodes = _routing_nodes_used(routes[best_i]["sol_nodes"], terminals)
+            for n in rnodes:
+                usage[n] -= 1
+                if usage[n] <= 0:
+                    del usage[n]
+
+            dropped.add(best_i)
+            overfull = current_overfull_nodes()
+
+        # --- Build outputs and remaining graph (commit packed nets) --------------
+
+        remaining_graph = _copy_graph(base_graph)
+
+        # Remove used routing nodes for packed (success & not dropped) nets
+        packed_routing_nodes = set()
+        results = [None] * len(terminal_sets)
+
+        for i, terminals in enumerate(terminal_sets):
+            r = routes[i] if routes[i] is not None else {
+                "terminal_set": terminals, "sol_nodes": set(), "sol_edges": set(), "success": False, "error": "unrouted"
+            }
+
+            if r.get("success", False) and i not in dropped:
+                rnodes = _routing_nodes_used(r["sol_nodes"], terminals)
+                packed_routing_nodes |= rnodes
+                results[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": r["sol_nodes"],
+                    "sol_edges": r["sol_edges"],
+                    "success": True
+                }
+            else:
+                err = r.get("error", "dropped due to congestion" if i in dropped else "unrouted")
+                results[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": set(),
+                    "sol_edges": set(),
+                    "success": False,
+                    "error": err,
+                }
+
+        # Apply node deletions (same semantics as your current steiner_packing)
+        for n in packed_routing_nodes:
+            if n in remaining_graph:
+                del remaining_graph[n]
+        for u in list(remaining_graph.keys()):
+            remaining_graph[u] = [(v, w) for (v, w) in remaining_graph[u] if v not in packed_routing_nodes]
+
+        return results, remaining_graph
+
+
     def visualize_packing_solution(self, graph, pos, packing_results, *, title="Steiner Packing Solution", only_used=True):
         """
         Visualize multiple Steiner trees from packing with different colors.
@@ -654,8 +929,7 @@ class LayoutEngine:
             sol_edges: iterable of undirected edges (u,v)
             terminals: optional list of terminal nodes to circle
         """
-        import matplotlib.pyplot as plt
-        from matplotlib.collections import LineCollection
+        
 
         fig, ax = plt.subplots(figsize=(max(6, self.W / 3), max(4, self.H / 3)))
 
