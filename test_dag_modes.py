@@ -10,7 +10,6 @@ from dag_steiner_processor import process_dag_with_steiner
 from circuit.circuit_to_pbc_dag import create_random_circuit, convert_to_PCB, create_dag
 from circuit.visualizer import visualize_dag
 import logging
-import matplotlib.pyplot as plt
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,12 +58,12 @@ def test_both_processing_modes():
         dag,
         layout_rows=3, layout_cols=3, 
         visualize_steps=True,  # Show step-by-step visualization
-        mode="steiner_packing"
+        mode="steiner_pathfinder"
     )
     
-    print("\nPacking Processing Results:")
-    #print(processor2.get_summary("steiner_packing"))
-    
+    print("\nPathfinder Processing Results:")
+    #print(processor2.get_summary("steiner_pathfinder"))
+
     return processor1, results1, processor2, results2
 
 
