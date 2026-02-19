@@ -1053,7 +1053,7 @@ class LayoutEngine:
         ax.invert_yaxis()
         ax.set_xticks(range(0, self.W+1))
         ax.set_yticks(range(0, self.H+1))
-        plt.show()
+        #plt.show()
 
     def visualize_graph(self, graph, pos, title="Routing graph overlay"):
         fig, ax = plt.subplots(figsize=(max(6, self.W/3), max(4, self.H/3)))
@@ -1119,7 +1119,7 @@ class LayoutEngine:
         ax.invert_yaxis()
         ax.set_xticks(range(0, self.W+1))
         ax.set_yticks(range(0, self.H+1))
-        plt.show()
+        #plt.show()
 
 
 # -------------------------

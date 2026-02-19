@@ -5,7 +5,7 @@ import statistics
 from pathlib import Path
 from typing import List, Tuple, Dict
 import time
-from circuit_to_pbc_dag import qasm_to_circuit, convert_to_PCB, create_dag
+from .circuit_to_pbc_dag import qasm_to_circuit, convert_to_PCB, create_dag
 from qiskit.dagcircuit import DAGCircuit
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.passes import RemoveFinalMeasurements, RemoveBarriers
