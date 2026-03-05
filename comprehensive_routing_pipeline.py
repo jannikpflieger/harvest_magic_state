@@ -389,9 +389,8 @@ class ComprehensiveRoutingPipeline:
                 'magic_terminal': result.get('magic_terminal', None),
                 'qubit_terminals': result.get('qubit_terminals', []),
                 'all_terminals': result.get('all_terminals', []),
-                'steiner_nodes': list(result.get('steiner_nodes', [])),
-                'steiner_edges': list(result.get('steiner_edges', [])),
                 'time_step': op_time_step
+                # Note: steiner_nodes and steiner_edges removed to reduce JSON file size
             }
             schedule['operation_details'].append(operation_detail)
             
@@ -418,15 +417,15 @@ class ComprehensiveRoutingPipeline:
                 else:
                     schedule['time_steps'][op_time_step]['failed_operations'] += 1
             
-            # Add routing path information if successful
-            if operation_detail['success'] and operation_detail['steiner_edges']:
+            # Add routing path information if successful (excluding large edge/node data)
+            if operation_detail['success']:
                 schedule['routing_paths'].append({
                     'gate_name': operation_detail['gate_name'],
                     'qubits': operation_detail['qubits'],
                     'time_step': op_time_step,
-                    'path_edges': operation_detail['steiner_edges'],
-                    'path_nodes': operation_detail['steiner_nodes'],
+                    'wirelength': operation_detail['wirelength'],
                     'terminals_used': operation_detail['all_terminals']
+                    # Note: path_edges and path_nodes removed to reduce JSON file size
                 })
         
         return schedule
@@ -849,22 +848,22 @@ def run_depth_sweep_experiment():
     """
     pipeline = ComprehensiveRoutingPipeline("routing_experiment_results")
     
-    # Run systematic depth experiment: 10x10 layout, depth 50-200 (step 25), 10 runs per depth
+    # Run systematic depth experiment: 5x5 layout, depth 10-100 (step 25), 10 runs per depth
     print("🔬 Starting comprehensive depth sweep experiment...")
-    print("   Layout: 10x10 (100 qubits)")
-    print("   Depths: 50, 75, 100, 125, 150, 175, 200")  
+    print("   Layout: 5x5 (25 qubits)")
+    print("   Depths: 10, 35, 60, 85, 100")  
     print("   Runs per depth: 10")
-    print("   Total experiments: 70")
+    print("   Total experiments: 50")
     print("   This may take several minutes...")
     
     results = pipeline.run_systematic_depth_experiment(
-        layout_rows=10,
-        layout_cols=10,
-        depth_start=50,
-        depth_end=200,
+        layout_rows=5,
+        layout_cols=5,
+        depth_start=10,
+        depth_end=100,
         depth_step=25,
         runs_per_depth=10,
-        experiment_name="depth_sweep_100qubits"
+        experiment_name="depth_sweep_25qubits"
     )
     
     print("\n🎉 Experiment completed!")
