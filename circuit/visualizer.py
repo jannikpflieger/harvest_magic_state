@@ -399,6 +399,6 @@ def process_all_circuit_analyses(results_dir="benchmark_circuits/circuit_analysi
 if __name__ == "__main__":
     # Process all circuit analysis JSON files
     process_all_circuit_analyses(
-        results_dir="benchmark_circuits/circuit_analysis_results/",
+        results_dir="benchmark_circuits/circuit_analysis_results/random/",
         plots_dir="../plots/"
     )
