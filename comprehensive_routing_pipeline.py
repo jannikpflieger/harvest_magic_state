@@ -11,11 +11,10 @@ This pipeline:
 6. Saves comprehensive results to JSON files
 """
 
-import os
 import json
 import time
 import statistics
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Any
 from pathlib import Path
 from datetime import datetime
 import logging
@@ -803,44 +802,6 @@ class ComprehensiveRoutingPipeline:
             logger.error(f"Failed to save experimental results to {filepath}: {e}")
 
 
-def main():
-    """Main function demonstrating pipeline usage."""
-    # Create pipeline instance
-    pipeline = ComprehensiveRoutingPipeline("routing_experiment_results")
-    
-    # Option 1: Run systematic depth experiment (recommended for comprehensive analysis)
-    print("🔬 Starting systematic depth experiment...")
-    experimental_results = pipeline.run_systematic_depth_experiment(
-        layout_rows=10,
-        layout_cols=10,
-        depth_start=50,
-        depth_end=200,
-        depth_step=25,
-        runs_per_depth=10,
-        experiment_name="comprehensive_depth_analysis"
-    )
-    
-    print(f"✓ Systematic experiment completed!")
-    print(f"   Total experiments: {experimental_results['experiment_metadata']['total_experiments']}")
-    print(f"   Success rate: {experimental_results['batch_results']['batch_summary']['success_rate']:.2%}")
-    print(f"   Runtime: {experimental_results['experiment_metadata']['total_runtime_ms']/1000:.1f}s")
-    
-    # Option 2: Quick batch test example (for comparison)
-    print("\n🚀 Running quick batch test example...")
-    batch_configs = [
-        {'circuit_source': 'random', 'layout_rows': 5, 'layout_cols': 5, 'circuit_depth': 50},
-        {'circuit_source': 'random', 'layout_rows': 5, 'layout_cols': 5, 'circuit_depth': 100},
-        {'circuit_source': 'random', 'layout_rows': 5, 'layout_cols': 5, 'circuit_depth': 150},
-    ]
-    
-    batch_result = pipeline.run_batch_tests(
-        batch_configs,
-        batch_name="quick_comparison"
-    )
-    
-    print(f"✓ Batch test completed: {batch_result['batch_summary']['successful_tests']}/{batch_result['batch_metadata']['num_tests']} successful")
-
-
 def run_depth_sweep_experiment():
     """
     Convenience function to run the systematic depth experiment.
@@ -849,12 +810,12 @@ def run_depth_sweep_experiment():
     pipeline = ComprehensiveRoutingPipeline("routing_experiment_results")
     
     # Run systematic depth experiment: 5x5 layout, depth 10-100 (step 25), 10 runs per depth
-    print("🔬 Starting comprehensive depth sweep experiment...")
-    print("   Layout: 5x5 (25 qubits)")
-    print("   Depths: 10, 35, 60, 85, 100")  
-    print("   Runs per depth: 10")
-    print("   Total experiments: 50")
-    print("   This may take several minutes...")
+    print("Starting comprehensive depth sweep experiment...")
+    print("Layout: 5x5 (25 qubits)")
+    print("Depths: 10, 35, 60, 85, 100")  
+    print("Runs per depth: 10")
+    print("Total experiments: 50")
+    print("This may take several minutes...")
     
     results = pipeline.run_systematic_depth_experiment(
         layout_rows=5,
@@ -866,16 +827,12 @@ def run_depth_sweep_experiment():
         experiment_name="depth_sweep_25qubits"
     )
     
-    print("\n🎉 Experiment completed!")
-    print(f"   Results saved to: routing_experiment_results/")
-    print(f"   Check the *_experimental_results.json file for detailed analysis")
+    print("\nExperiment completed!")
+    print(f"Results saved to: routing_experiment_results/")
+    print(f"Check the *_experimental_results.json file for detailed analysis")
     
     return results
 
 
 if __name__ == "__main__":
-    # Run the systematic experiment
     run_depth_sweep_experiment()
-    
-    # Or run the main function with both examples
-    # main()

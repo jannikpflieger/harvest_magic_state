@@ -1,7 +1,6 @@
 import logging
 from lattice_test.lattice_double_patches import LayoutEngine
 from lattice_test.attached_preset_layout import build_7x9_magic_ring_layout, nxm_ring_layout_single_qubits
-import random
 from collections import defaultdict
 
 # Get logger for this module
