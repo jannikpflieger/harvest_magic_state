@@ -57,3 +57,4 @@ src/testTestingRootWkspc/coverageWorkspace/.coverage
 
 circuit/benchmark_circuits/**
 *.png
+routing_experiment_results/**

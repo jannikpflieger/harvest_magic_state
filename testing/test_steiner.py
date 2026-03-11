@@ -1,5 +1,5 @@
-from lattice_double_patches import LayoutEngine
-from attached_preset_layout import build_7x9_magic_ring_layout, nxm_ring_layout_single_qubits
+from lattice_test.lattice_double_patches import LayoutEngine
+from lattice_test.attached_preset_layout import build_7x9_magic_ring_layout, nxm_ring_layout_single_qubits
 
 #eng = build_7x9_magic_ring_layout()
 eng = nxm_ring_layout_single_qubits(4, 4)

@@ -1,7 +1,7 @@
 import traceback
 import numpy as np
-from circuit_to_pbc_dag import convert_to_PCB, create_dag, create_random_circuit, mqt_bench_pipeline
-from visualizer import visualize_dag
+from circuit.circuit_to_pbc_dag import convert_to_PCB, create_dag, create_random_circuit, mqt_bench_pipeline
+from circuit.visualizer import visualize_dag
 
 
 def analyze_dag_layers(dag, title="Circuit DAG Analysis"):
@@ -96,7 +96,6 @@ def analyze_dag_layers(dag, title="Circuit DAG Analysis"):
         print(f"Weight distribution: {dict(zip(*np.unique(all_pauli_weights, return_counts=True)))}")
     
     return layer_data
-
 
 
 def test_convert_to_PCB(qc, visualize=False, analyze_layers=True):

@@ -15,7 +15,7 @@ def load_and_visualize_qft_dag():
     Load the QFT N010 circuit and visualize its DAG structure.
     """
     # Path to the QFT N010 QASM file
-    qasm_file = "benchmark_circuits/qasm/qft/qft_N010.qasm"
+    qasm_file = "benchmark_circuits/qasm/qv/qv_N010_12345.qasm"
     
     print("=" * 60)
     print("QFT N010 Circuit PBC DAG Visualization")
@@ -38,6 +38,7 @@ def load_and_visualize_qft_dag():
         print("\nConverting circuit to PBC format...")
         pbc_circuit = convert_to_PCB(transpiled_circuit, fix_clifford=False, verbose=True)
         
+        print(pbc_circuit)
         # Create DAG from the PBC circuit
         print("\nConverting PBC circuit to DAG...")
         dag = create_dag(pbc_circuit)

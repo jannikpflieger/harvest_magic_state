@@ -1,7 +1,6 @@
 import logging
 from lattice_test.lattice_double_patches import LayoutEngine
 from lattice_test.attached_preset_layout import build_7x9_magic_ring_layout, nxm_ring_layout_single_qubits
-import random
 from collections import defaultdict
 
 # Get logger for this module
@@ -626,6 +625,9 @@ class DAGProcessor:
                 logger.warning("No ready nodes found, but not all nodes processed. Breaking to avoid infinite loop.")
                 break
             
+            # Reset magic terminal tracking for each step - all patches available again
+            self.used_magic_terminals = set()
+            
             # Process the first ready node
             node = ready_nodes[0]
             result = self.process_dag_node(dag, node)
@@ -663,6 +665,9 @@ class DAGProcessor:
         
         while len(processed_nodes) < len(all_op_nodes):
             logger.info(f"=== Time Step {time_step} ===")
+            
+            # Reset magic terminal tracking for each time step - all patches available again
+            self.used_magic_terminals = set()
             
             ready_nodes = self._get_ready_nodes(dag, all_op_nodes, processed_nodes)
             
@@ -724,6 +729,9 @@ class DAGProcessor:
         
         while len(processed_nodes) < len(all_op_nodes):
             logger.info(f"=== Time Step {time_step} ===")
+            
+            # Reset magic terminal tracking for each time step - all patches available again
+            self.used_magic_terminals = set()
             
             ready_nodes = self._get_ready_nodes(dag, all_op_nodes, processed_nodes)
             
