@@ -478,7 +478,7 @@ def run_qasm_pipeline(benchmark_dir: str = None, max_files: int = None,
 
     if benchmark_dir is None:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        benchmark_dir = os.path.join(current_dir, "..", "..", "..", "circuit", "benchmark_circuits", "qasm")
+        benchmark_dir = os.path.join(current_dir, "..", "..", "..", "benchmark_circuits", "qasm")
 
     print(f"Starting comprehensive QASM analysis pipeline...")
     print(f"Searching for QASM files in: {benchmark_dir}")

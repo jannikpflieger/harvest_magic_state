@@ -86,6 +86,42 @@ def cmd_plot(args):
     create_wirelength_plot(data, output_filename=args.output)
 
 
+def cmd_plot_pauli(args):
+    """Generate Pauli evolution metric plots from circuit analysis results."""
+    from harvest.compilation.visualizer import (
+        process_all_circuit_analyses,
+        visualize_circuit_information,
+    )
+    from pathlib import Path
+
+    if args.file:
+        file_path = Path(args.file)
+        if not file_path.exists():
+            print(f"Error: File not found: {file_path}")
+            return
+        plots_dir = Path(args.plots_dir)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        save_path = plots_dir / f"{file_path.stem}_analysis.png"
+        print(f"Processing: {file_path}")
+        visualize_circuit_information(
+            str(file_path),
+            window_size=args.window_size,
+            save_file=str(save_path),
+            show_plot=args.show,
+        )
+    else:
+        results_dir = Path(args.results_dir)
+        if not results_dir.exists():
+            print(f"Error: Results directory not found: {results_dir}")
+            return
+        print(f"Processing all circuit analysis files in: {results_dir}")
+        print(f"Saving plots to: {args.plots_dir}")
+        process_all_circuit_analyses(
+            results_dir=str(results_dir),
+            plots_dir=args.plots_dir,
+        )
+
+
 def cmd_analyze_circuits(args):
     """Analyse benchmark QASM circuits (gate counts, PCB conversion, DAG metrics)."""
     from harvest.compilation.circuit_analysis import run_qasm_pipeline
@@ -140,6 +176,20 @@ def build_parser():
     p_plot.add_argument("results_dir", help="Directory with JSON results")
     p_plot.add_argument("--output", type=str, default="wirelength_comparison.png")
 
+    # --- plot-pauli ---
+    p_pp = sub.add_parser("plot-pauli", help="Generate Pauli evolution metric plots")
+    p_pp.add_argument("--results-dir",
+                      default="../benchmark_circuits/circuit_analysis_results/",
+                      help="Directory containing circuit analysis JSON files")
+    p_pp.add_argument("--plots-dir", default="../plots/",
+                      help="Directory to save generated plots")
+    p_pp.add_argument("--file", default=None,
+                      help="Process a single JSON file instead of the whole directory")
+    p_pp.add_argument("--window-size", type=int, default=None,
+                      help="Moving window size (default: auto-calculated)")
+    p_pp.add_argument("--show", action="store_true",
+                      help="Display plots interactively")
+
     # --- analyze-circuits ---
     p_ac = sub.add_parser("analyze-circuits", help="Analyse benchmark QASM circuits")
     p_ac.add_argument("--benchmark-dir", help="Path to benchmark QASM directory")
@@ -161,6 +211,7 @@ def main():
         "bench": cmd_bench,
         "analyze": cmd_analyze,
         "plot": cmd_plot,
+        "plot-pauli": cmd_plot_pauli,
         "analyze-circuits": cmd_analyze_circuits,
     }
 
