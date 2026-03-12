@@ -200,6 +200,70 @@ def nxm_ring_layout_single_qubits_large_spacing(n: int, m: int, *, start_with: s
     return eng
 
 
+def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_xz: bool = False) -> LayoutEngine:
+    """
+    Build an n x m grid layout with blocks of 4-qubit patches and a ring of magic states around it.
+    
+    Layout structure:
+    - Interior: n x m blocks of 4-qubit patches (2x2 arrangement of single-cell patches)
+    - Spacing: 1 patch between adjacent blocks
+    - Magic ring: magic state patches on the boundary, 1 patch spacing from the blocks
+    - Magic ports face inward (toward the center)
+
+    Grid dimensions:
+    - Each block occupies a 3x3 area (2x2 for qubits + 1 for spacing)
+    - n x m blocks => (3n-1) x (3m-1) cells for blocks
+    - with 1-patch spacing between blocks and magic states: (3n+1) x (3m+1) cells
+    - actual layout: (3n+3) x (3m+3) cells
+    
+    Example: n=2, m=2 => layout is 9x9
+    """
+    # Calculate grid dimensions
+    # n x m blocks of 4 qubits with spacing: (3n-1) x (3m-1) cells for blocks
+    # + 1 patch on each side for spacing before magic: (3n+1) x (3m+1) cells
+    # + 1 patch on each side for magic patches: (3n+3) x (3m+3) cells
+    W = 3 * n + 3
+    H = 3 * m + 3
+
+    eng = LayoutEngine(W, H)
+    
+    # --- Place blocks of 4 qubits in n x m grid ---
+    # Position (i, j) -> block origin at cell (3*i + 2, 3*j + 2)
+    for i in range(n):
+        for j in range(m):
+            ox = 3 * i + 2
+            oy = 3 * j + 2
+            block_patches = [
+                data_patch_1cell(f"q_{i}_{j}_0", (ox, oy), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{i}_{j}_1", (ox + 1, oy), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{i}_{j}_2", (ox, oy + 1), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{i}_{j}_3", (ox + 1, oy + 1), swap_xz=swap_xz),
+            ]
+            for p in block_patches:
+                eng.add_patch(p)
+
+    # --- Place magic state patches around the perimeter ---
+    # Top edge (y=0): face inward => port on 'S'
+    for x in range(1, W - 1):
+        eng.add_patch(magic_patch_1cell(f"mT{x}", (x, 0), side="S"))
+    
+    # Bottom edge (y=H-1): face inward => port on 'N'
+    for x in range(1, W - 1):
+        eng.add_patch(magic_patch_1cell(f"mB{x}", (x, H - 1), side="N"))
+    
+    # Left edge (x=0): face inward => port on 'E'
+    for y in range(1, H - 1):
+        eng.add_patch(magic_patch_1cell(f"mL{y}", (0, y), side="E"))
+    
+    # Right edge (x=W-1): face inward => port on 'W'
+    for y in range(1, H - 1):
+        eng.add_patch(magic_patch_1cell(f"mR{y}", (W - 1, y), side="W"))
+    
+    return eng
+
+
+
+
 if __name__ == "__main__":
     # Test with the existing 7x9 layout
     #eng = build_7x9_magic_ring_layout()
@@ -211,7 +275,12 @@ if __name__ == "__main__":
     #eng_2x2 = nxm_ring_layout_single_qubits(10, 10)
     #eng_2x2.visualize_layout("2x2 single-qubit layout (7x7 grid)")
 
-    eng_5x5_large = nxm_ring_layout_single_qubits_large_spacing(5, 5)
-    eng_5x5_large.visualize_layout("5x5 single-qubit layout with large spacing (17x17 grid)")
-    graph, ports_by_patch, pos, patch_used_by_port = eng_5x5_large.build_routing_graph()
-    eng_5x5_large.visualize_graph(graph, pos, "Routing graph overlay for 5x5 large spacing")
+    #eng_5x5_large = nxm_ring_layout_single_qubits_large_spacing(5, 5)
+    #eng_5x5_large.visualize_layout("5x5 single-qubit layout with large spacing (17x17 grid)")
+    #graph, ports_by_patch, pos, patch_used_by_port = eng_5x5_large.build_routing_graph()
+    #eng_5x5_large.visualize_graph(graph, pos, "Routing graph overlay for 5x5 large spacing")
+
+    eng = blocks_of_four_qubit_patches(2, 2)
+    eng.visualize_layout("2x2 blocks of 4 qubits with magic ring (9x9 grid)")
+    graph, ports_by_patch, pos, patch_used_by_port = eng.build_routing_graph()
+    eng.visualize_graph(graph, pos, "Routing graph overlay for 2x2 blocks of 4 qubits")
