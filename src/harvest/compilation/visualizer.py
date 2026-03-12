@@ -1,13 +1,8 @@
 import matplotlib
-import os
-# Only use non-interactive Agg backend if explicitly requested
-if os.environ.get('MATPLOTLIB_BACKEND') == 'Agg':
-    matplotlib.use('Agg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import networkx as nx
 import json
-import os
-import glob
 import numpy as np
 from pathlib import Path
 
@@ -32,8 +27,6 @@ def visualize_dag(dag, title="Circuit DAG"):
     if not all_nodes:
         print("No operation nodes found!")
         return dag
-    
-    #print(f"Found {len(all_nodes)} operation nodes")
     
     # Create NetworkX graph
     G = nx.DiGraph()
@@ -61,9 +54,7 @@ def visualize_dag(dag, title="Circuit DAG"):
             tgt_idx = node_to_idx[target]
             G.add_edge(src_idx, tgt_idx)
             edge_count += 1
-            #print(f"Edge: {src_idx} -> {tgt_idx}")
     
-    #print(f"Added {edge_count} edges")
     
     # Visualize with chronological layout (left to right)
     plt.figure(figsize=(14, 10))
