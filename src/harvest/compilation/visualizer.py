@@ -28,8 +28,6 @@ def visualize_dag(dag, title="Circuit DAG"):
         print("No operation nodes found!")
         return dag
     
-    #print(f"Found {len(all_nodes)} operation nodes")
-    
     # Create NetworkX graph
     G = nx.DiGraph()
     labels = {}
@@ -56,9 +54,7 @@ def visualize_dag(dag, title="Circuit DAG"):
             tgt_idx = node_to_idx[target]
             G.add_edge(src_idx, tgt_idx)
             edge_count += 1
-            #print(f"Edge: {src_idx} -> {tgt_idx}")
     
-    #print(f"Added {edge_count} edges")
     
     # Visualize with chronological layout (left to right)
     plt.figure(figsize=(14, 10))

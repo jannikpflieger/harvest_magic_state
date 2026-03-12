@@ -3,7 +3,6 @@ DAG traversal and time-step scheduling strategies for routing.
 """
 
 import logging
-from collections import defaultdict
 
 logger = logging.getLogger('HarvestMagicState.DAGProcessor')
 detailed_logger = logging.getLogger('HarvestMagicState.Detailed')
