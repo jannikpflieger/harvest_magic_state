@@ -21,7 +21,6 @@ Usage:
 """
 
 import argparse
-
 from harvest.compilation.circuit_analysis import run_qasm_pipeline
 
 

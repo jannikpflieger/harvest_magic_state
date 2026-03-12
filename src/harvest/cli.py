@@ -10,15 +10,19 @@ Usage:
 """
 
 import argparse
-import sys
+from harvest.compilation.visualizer import process_all_circuit_analyses, visualize_circuit_information
+from harvest.compilation.pauli_block_conversion import convert_to_PCB, create_dag, create_random_circuit
+from harvest.compilation.qasm_loader import qasm_to_circuit
+from harvest.compilation.circuit_analysis import run_qasm_pipeline
+from harvest.routing import process_dag_with_steiner
+from harvest.evaluation import ComprehensiveRoutingPipeline
+from harvest.evaluation.plotting import extract_wirelength_data, create_wirelength_plot
+from scripts.analyze_results import RoutingResultsAnalyzer
+from pathlib import Path
 
 
 def cmd_run(args):
     """Run the pipeline on a single circuit."""
-    from harvest.compilation.pauli_block_conversion import convert_to_PCB, create_dag, create_random_circuit
-    from harvest.compilation.qasm_loader import qasm_to_circuit
-    from harvest.routing import process_dag_with_steiner
-
     if args.qasm:
         circuit = qasm_to_circuit(args.qasm)
         print(f"Loaded circuit from {args.qasm}")
@@ -41,7 +45,6 @@ def cmd_run(args):
 
 def cmd_bench(args):
     """Run a depth-sweep benchmark experiment."""
-    from harvest.evaluation import ComprehensiveRoutingPipeline
 
     pipeline = ComprehensiveRoutingPipeline(args.output_dir)
     pipeline.run_systematic_depth_experiment(
@@ -57,8 +60,6 @@ def cmd_bench(args):
 
 def cmd_analyze(args):
     """Analyze routing experiment results."""
-    # Re-use the standalone analyzer script
-    from scripts.analyze_results import RoutingResultsAnalyzer
 
     analyzer = RoutingResultsAnalyzer(args.results_dir)
     loaded = analyzer.load_results()
@@ -76,8 +77,7 @@ def cmd_analyze(args):
 
 
 def cmd_plot(args):
-    """Generate wirelength plots from results."""
-    from harvest.evaluation.plotting import extract_wirelength_data, create_wirelength_plot
+    """Generate wirelength plots from results.""" 
 
     data = extract_wirelength_data(args.results_dir)
     if not data:
@@ -88,11 +88,6 @@ def cmd_plot(args):
 
 def cmd_plot_pauli(args):
     """Generate Pauli evolution metric plots from circuit analysis results."""
-    from harvest.compilation.visualizer import (
-        process_all_circuit_analyses,
-        visualize_circuit_information,
-    )
-    from pathlib import Path
 
     if args.file:
         file_path = Path(args.file)
@@ -121,10 +116,33 @@ def cmd_plot_pauli(args):
             plots_dir=args.plots_dir,
         )
 
+def cmd_bench_qasm(args):
+    """Run routing experiments on QASM benchmark circuits."""
+    
+    pipeline = ComprehensiveRoutingPipeline(args.output_dir)
+    pipeline.run_qasm_experiment(
+        qasm_dir=args.qasm_dir,
+        layout_rows=args.rows,
+        layout_cols=args.cols,
+        experiment_name=args.name,
+    )
+
+def cmd_plot_qasm(args):
+    """Generate wirelength plots from QASM experiment results (grouped by qubit count)."""
+    from harvest.evaluation.plotting import extract_qasm_wirelength_data, create_qasm_wirelength_plot
+
+    data = extract_qasm_wirelength_data(args.results_dir)
+    if not data:
+        print("No data found.")
+        return
+    create_qasm_wirelength_plot(
+        data,
+        output_filename=args.output,
+        title_prefix=f"{args.title_prefix} " if args.title_prefix else '',
+    )
 
 def cmd_analyze_circuits(args):
     """Analyse benchmark QASM circuits (gate counts, PCB conversion, DAG metrics)."""
-    from harvest.compilation.circuit_analysis import run_qasm_pipeline
 
     run_qasm_pipeline(
         benchmark_dir=args.benchmark_dir,
@@ -133,7 +151,6 @@ def cmd_analyze_circuits(args):
         output_json=args.output_json,
         skip_unsupported=not args.include_unsupported,
     )
-
 
 def build_parser():
     parser = argparse.ArgumentParser(
@@ -190,6 +207,22 @@ def build_parser():
     p_pp.add_argument("--show", action="store_true",
                       help="Display plots interactively")
 
+    # --- bench-qasm ---
+    p_bq = sub.add_parser("bench-qasm", help="Run routing experiments on QASM benchmark circuits")
+    p_bq.add_argument("qasm_dir", help="Directory containing QASM files")
+    p_bq.add_argument("--rows", type=int, default=None, help="Layout rows (auto-sized if omitted)")
+    p_bq.add_argument("--cols", type=int, default=None, help="Layout columns (auto-sized if omitted)")
+    p_bq.add_argument("--name", type=str, default="qasm_sweep", help="Experiment name")
+    p_bq.add_argument("--output-dir", type=str, default="routing_experiment_results",
+                      help="Directory for result JSON files")
+
+    # --- plot-qasm ---
+    p_pq = sub.add_parser("plot-qasm", help="Generate wirelength plots from QASM experiment results")
+    p_pq.add_argument("results_dir", help="Directory with JSON result files")
+    p_pq.add_argument("--output", type=str, default="qasm_wirelength_comparison.png")
+    p_pq.add_argument("--title-prefix", type=str, default="",
+                      help="Prefix for the plot title (e.g. 'QAOA')")
+
     # --- analyze-circuits ---
     p_ac = sub.add_parser("analyze-circuits", help="Analyse benchmark QASM circuits")
     p_ac.add_argument("--benchmark-dir", help="Path to benchmark QASM directory")
@@ -212,6 +245,8 @@ def main():
         "analyze": cmd_analyze,
         "plot": cmd_plot,
         "plot-pauli": cmd_plot_pauli,
+        "bench-qasm": cmd_bench_qasm,
+        "plot-qasm": cmd_plot_qasm,
         "analyze-circuits": cmd_analyze_circuits,
     }
 

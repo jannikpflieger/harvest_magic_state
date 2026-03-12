@@ -7,7 +7,6 @@ Usage:
     python scripts/analyze_results.py routing_experiment_results --plots --detailed
 """
 
-import os
 import json
 import statistics
 from pathlib import Path

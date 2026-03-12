@@ -22,7 +22,7 @@ import logging
 from harvest.routing import DAGProcessor, process_dag_with_steiner
 from harvest.compilation.pauli_block_conversion import create_random_circuit, convert_to_PCB, create_dag
 from harvest.compilation.qasm_loader import qasm_to_circuit
-from harvest.compilation.circuit_analysis import analyze_single_circuit
+from harvest.compilation.circuit_analysis import analyze_single_circuit, convert_rx_ry_to_rz
 from harvest.compilation.visualizer import visualize_dag
 
 logger = logging.getLogger('ComprehensiveRoutingPipeline')
@@ -154,6 +154,12 @@ class ComprehensiveRoutingPipeline:
                 logger.info(f"DAG analysis: {'✓' if circuit_info.get('dag_analysis_successful') else '✗'}")
             else:
                 logger.warning(f"Circuit analysis failed: {circuit_info.get('error')}")
+
+            # Transpile rx/ry gates to rz equivalents if needed
+            gate_counts = circuit.count_ops()
+            if 'rx' in gate_counts or 'ry' in gate_counts:
+                logger.info("Converting rx/ry gates to rz equivalents...")
+                circuit = convert_rx_ry_to_rz(circuit)
 
         try:
             pcb_circuit = convert_to_PCB(circuit)
@@ -669,6 +675,157 @@ class ComprehensiveRoutingPipeline:
             logger.info(f"Experimental results saved to: {filepath}")
         except Exception as e:
             logger.error(f"Failed to save experimental results to {filepath}: {e}")
+
+
+    def run_qasm_experiment(self,
+                           qasm_dir: str,
+                           layout_rows: int = None,
+                           layout_cols: int = None,
+                           experiment_name: str = "qasm_sweep",
+                           file_pattern: str = "*.qasm") -> Dict:
+        """
+        Run routing experiments on QASM benchmark circuits from a directory.
+
+        Each circuit is routed once with all algorithms. The number of qubits
+        is extracted from the circuit itself and used as the grouping key
+        (analogous to 'depth' in the depth-sweep experiment).
+
+        Args:
+            qasm_dir: Directory containing QASM files
+            layout_rows: Grid rows (if None, auto-sized per circuit)
+            layout_cols: Grid cols (if None, auto-sized per circuit)
+            experiment_name: Name prefix for output files
+            file_pattern: Glob pattern for QASM files
+        """
+        import math, glob as _glob
+
+        experiment_start_time = time.time()
+        experiment_id = f"{experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        qasm_path = Path(qasm_dir)
+        qasm_files = sorted(qasm_path.glob(file_pattern))
+        if not qasm_files:
+            logger.error(f"No QASM files matching '{file_pattern}' in {qasm_dir}")
+            return {}
+
+        total_experiments = len(qasm_files)
+        logger.info(f"Starting QASM experiment: {experiment_id}")
+        logger.info(f"Directory: {qasm_dir}  ({total_experiments} files)")
+
+        test_configs = []
+        for qasm_file in qasm_files:
+            config = {
+                'circuit_source': str(qasm_file),
+                'layout_rows': layout_rows or 0,   # placeholder; resolved below
+                'layout_cols': layout_cols or 0,
+                'test_name': f"{experiment_name}_{qasm_file.stem}",
+                'visualize': False,
+            }
+            test_configs.append(config)
+
+        # --- run each test (auto-size grid when needed) ---
+        all_results = []
+        for i, config in enumerate(test_configs):
+            logger.info(f"[{i+1}/{total_experiments}] {Path(config['circuit_source']).name}")
+
+            # Auto-size grid if not specified
+            if config['layout_rows'] == 0 or config['layout_cols'] == 0:
+                try:
+                    circ = qasm_to_circuit(config['circuit_source'])
+                    n_qubits = circ.num_qubits
+                    side = int(math.ceil(math.sqrt(n_qubits)))
+                    config['layout_rows'] = side
+                    config['layout_cols'] = side
+                    logger.info(f"  Auto-sized grid to {side}x{side} for {n_qubits} qubits")
+                except Exception as e:
+                    logger.error(f"  Could not determine qubit count: {e}")
+                    continue
+
+            try:
+                result = self.run_single_test(**config)
+                all_results.append(result)
+            except Exception as e:
+                logger.error(f"  Test failed: {e}")
+                all_results.append({
+                    'test_metadata': {'test_id': config['test_name'], 'status': 'FAILED'},
+                    'error': str(e),
+                })
+
+        # --- aggregate by num_qubits ---
+        results_by_qubits: Dict[int, Dict] = {}
+        for result in all_results:
+            circuit_info = result.get('circuit_info', {})
+            n_q = circuit_info.get('num_qubits') or result.get('layout_info', {}).get('total_patches', 0)
+            if n_q == 0:
+                continue
+
+            if n_q not in results_by_qubits:
+                results_by_qubits[n_q] = {
+                    'num_qubits': n_q,
+                    'results': [],
+                    'summary': {
+                        'successful_runs': 0,
+                        'failed_runs': 0,
+                        'algorithm_performance': {},
+                    }
+                }
+
+            results_by_qubits[n_q]['results'].append(result)
+            summary = results_by_qubits[n_q]['summary']
+
+            if result.get('test_metadata', {}).get('status') != 'FAILED':
+                summary['successful_runs'] += 1
+                for alg_name, alg_result in result.get('algorithm_results', {}).items():
+                    if alg_name not in summary['algorithm_performance']:
+                        summary['algorithm_performance'][alg_name] = {
+                            'successful_runs': 0,
+                            'total_wirelength': [],
+                            'runtime_ms': [],
+                            'success_rates': [],
+                        }
+                    alg_perf = summary['algorithm_performance'][alg_name]
+                    if alg_result.get('status') == 'SUCCESS':
+                        alg_perf['successful_runs'] += 1
+                        alg_perf['runtime_ms'].append(alg_result.get('runtime_ms', 0))
+                        metrics = alg_result.get('metrics', {})
+                        if metrics.get('total_wirelength', 0) > 0:
+                            alg_perf['total_wirelength'].append(metrics['total_wirelength'])
+                        if 'success_rate' in metrics:
+                            alg_perf['success_rates'].append(metrics['success_rate'])
+            else:
+                summary['failed_runs'] += 1
+
+        # compute averages
+        for n_q, qdata in results_by_qubits.items():
+            summary = qdata['summary']
+            total = summary['successful_runs'] + summary['failed_runs']
+            if total:
+                summary['success_rate'] = summary['successful_runs'] / total
+            for alg_perf in summary['algorithm_performance'].values():
+                if alg_perf['runtime_ms']:
+                    alg_perf['avg_runtime_ms'] = statistics.mean(alg_perf['runtime_ms'])
+                if alg_perf['total_wirelength']:
+                    alg_perf['avg_wirelength'] = statistics.mean(alg_perf['total_wirelength'])
+                    alg_perf['std_wirelength'] = (statistics.stdev(alg_perf['total_wirelength'])
+                                                  if len(alg_perf['total_wirelength']) > 1 else 0)
+
+        experiment_runtime = (time.time() - experiment_start_time) * 1000
+
+        experimental_results = {
+            'experiment_metadata': {
+                'experiment_id': experiment_id,
+                'experiment_name': experiment_name,
+                'timestamp': datetime.now().isoformat(),
+                'total_runtime_ms': experiment_runtime,
+                'qasm_dir': str(qasm_dir),
+                'total_circuits': total_experiments,
+            },
+            'results_by_qubits': results_by_qubits,
+        }
+
+        self._save_experimental_results(experimental_results)
+        logger.info(f"QASM experiment {experiment_id} completed in {experiment_runtime/1000:.2f}s")
+        return experimental_results
 
 
 def run_depth_sweep_experiment():

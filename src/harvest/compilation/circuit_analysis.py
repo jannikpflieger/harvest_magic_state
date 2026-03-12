@@ -5,7 +5,6 @@ Circuit analysis, gate filtering, DAG layer metrics, and batch reporting.
 import os
 import json
 import statistics
-from pathlib import Path
 from typing import List, Tuple, Dict
 import time
 

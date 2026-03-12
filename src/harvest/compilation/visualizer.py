@@ -1,13 +1,8 @@
 import matplotlib
-import os
-# Only use non-interactive Agg backend if explicitly requested
-if os.environ.get('MATPLOTLIB_BACKEND') == 'Agg':
-    matplotlib.use('Agg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import networkx as nx
 import json
-import os
-import glob
 import numpy as np
 from pathlib import Path
 
