@@ -47,15 +47,10 @@ class Patch:
     ports: List[EdgePort] = field(default_factory=list)
 
 
-# -------------------------
-# Layout Engine
-# -------------------------
-
 class LayoutEngine:
     def __init__(self, width: int, height: int):
         self.W = width
         self.H = height
-        # "PATCH:<name>" or "BLOCKED"; missing => FREE
         self.occ: Dict[Coord, str] = {}
         self.patches: Dict[str, Patch] = {}
 

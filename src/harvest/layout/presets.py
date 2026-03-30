@@ -111,12 +111,15 @@ def nxm_ring_layout_single_qubits(n: int, m: int, *, start_with: str = "X", swap
     # --- Place logical data qubits in n x m grid ---
     # Position (i, j) -> cell (2*i + 2, 2*j + 2)
     # This ensures 1-patch spacing between adjacent qubits
+    # Qubits are numbered sequentially: q_0, q_1, q_2, ..., q_(n*m-1)
+    qubit_idx = 0
     for i in range(n):
         for j in range(m):
             x = 2 * i + 2
             y = 2 * j + 2
-            qubit_name = f"q_{i}_{j}"
+            qubit_name = f"q_{qubit_idx}"
             eng.add_patch(data_patch_1cell(qubit_name, (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
 
     # --- Place magic state patches around the perimeter ---
     # Top edge (y=0): face inward => port on 'S'
@@ -173,12 +176,15 @@ def nxm_ring_layout_single_qubits_large_spacing(n: int, m: int, *, start_with: s
     # --- Place logical data qubits in n x m grid ---
     # Position (i, j) -> cell (3*i + 2, 3*j + 2)
     # This ensures 2-patch spacing between adjacent qubits
+    # Qubits are numbered sequentially: q_0, q_1, q_2, ..., q_(n*m-1)
+    qubit_idx = 0
     for i in range(n):
         for j in range(m):
             x = 3 * i + 2
             y = 3 * j + 2
-            qubit_name = f"q_{i}_{j}"
+            qubit_name = f"q_{qubit_idx}"
             eng.add_patch(data_patch_1cell(qubit_name, (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
 
     # --- Place magic state patches around the perimeter ---
     # Top edge (y=0): face inward => port on 'S'
@@ -229,18 +235,21 @@ def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_
     
     # --- Place blocks of 4 qubits in n x m grid ---
     # Position (i, j) -> block origin at cell (3*i + 2, 3*j + 2)
+    # Qubits are numbered sequentially: q_0, q_1, q_2, ..., q_(n*m*4-1)
+    qubit_idx = 0
     for i in range(n):
         for j in range(m):
             ox = 3 * i + 2
             oy = 3 * j + 2
             block_patches = [
-                data_patch_1cell(f"q_{i}_{j}_0", (ox, oy), swap_xz=swap_xz),
-                data_patch_1cell(f"q_{i}_{j}_1", (ox + 1, oy), swap_xz=swap_xz),
-                data_patch_1cell(f"q_{i}_{j}_2", (ox, oy + 1), swap_xz=swap_xz),
-                data_patch_1cell(f"q_{i}_{j}_3", (ox + 1, oy + 1), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{qubit_idx}", (ox, oy), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{qubit_idx + 1}", (ox + 1, oy), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{qubit_idx + 2}", (ox, oy + 1), swap_xz=swap_xz),
+                data_patch_1cell(f"q_{qubit_idx + 3}", (ox + 1, oy + 1), swap_xz=swap_xz),
             ]
             for p in block_patches:
                 eng.add_patch(p)
+            qubit_idx += 4
 
     # --- Place magic state patches around the perimeter ---
     # Top edge (y=0): face inward => port on 'S'

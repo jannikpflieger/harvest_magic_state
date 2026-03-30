@@ -27,12 +27,24 @@ class DAGProcessor:
     Processes DAG nodes sequentially, integrating with Steiner algorithm for magic state routing.
     """
 
-    def __init__(self, layout_rows=4, layout_cols=4):
+    def __init__(self, layout_rows=4, layout_cols=4, layout_engine=None):
+        """
+        Initialize the DAG processor.
+        
+        Args:
+            layout_rows: Number of rows (used if layout_engine is None)
+            layout_cols: Number of columns (used if layout_engine is None)
+            layout_engine: Pre-built LayoutEngine instance (overrides layout_rows/cols)
+        """
         self.layout_rows = layout_rows
         self.layout_cols = layout_cols
 
         # Setup the layout engine
-        self.eng = nxm_ring_layout_single_qubits(layout_rows, layout_cols)
+        if layout_engine is not None:
+            self.eng = layout_engine
+        else:
+            self.eng = nxm_ring_layout_single_qubits(layout_rows, layout_cols)
+        
         self.graph, self.ports_by_patch, self.pos, self.patch_used_by_port = self.eng.build_routing_graph()
 
         detailed_logger.info(f"Position dictionary contains {len(self.pos)} entries:")
@@ -226,9 +238,8 @@ class DAGProcessor:
             detailed_logger.info(f"Node {node.op.name} acts on qubits: {qubit_indices}")
 
             for qubit_index in qubit_indices:
-                row = qubit_index // self.layout_cols
-                col = qubit_index % self.layout_cols
-                patch_name = f"q_{row}_{col}"
+                # Use sequential qubit numbering: q_0, q_1, q_2, ...
+                patch_name = f"q_{qubit_index}"
 
                 detailed_logger.info(f"Mapping qubit {qubit_index} to patch {patch_name}")
 
@@ -278,9 +289,8 @@ class DAGProcessor:
             detailed_logger.info(f"Node {node.op.name} acts on qubits: {qubit_indices}")
 
             for qubit_index in qubit_indices:
-                row = qubit_index // self.layout_cols
-                col = qubit_index % self.layout_cols
-                patch_name = f"q_{row}_{col}"
+                # Use sequential qubit numbering: q_0, q_1, q_2, ...
+                patch_name = f"q_{qubit_index}"
 
                 detailed_logger.info(f"Mapping qubit {qubit_index} to patch {patch_name}")
 

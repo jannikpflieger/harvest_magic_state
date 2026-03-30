@@ -7,7 +7,7 @@ LayoutEngine can delegate to them without carrying the plotting code itself.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING,Tuple, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -17,11 +17,6 @@ if TYPE_CHECKING:
 
 Coord = Tuple[int, int]
 Node = Union[Coord, str]
-
-
-# ------------------------------------------------------------------
-# Internal helpers
-# ------------------------------------------------------------------
 
 def _induced_subgraph(graph, pos, keep_nodes):
     """
@@ -89,11 +84,6 @@ def _draw_port_nodes(ax, port_nodes, pos):
                    c=COLOR_MAP.get(t, "k"),
                    edgecolors="k",
                    linewidths=0.6)
-
-
-# ------------------------------------------------------------------
-# Public visualisation functions
-# ------------------------------------------------------------------
 
 def visualize_packing_solution(
     eng: "LayoutEngine",
@@ -290,7 +280,6 @@ def visualize_layout(eng: "LayoutEngine", title="Layout", show_ports=True):
                            linewidths=0.6)
 
     _finish_axes(eng, ax, title)
-    # NOTE: intentionally not calling plt.show() here (consistent with original)
 
 
 def visualize_graph(eng: "LayoutEngine", graph, pos, title="Routing graph overlay"):
