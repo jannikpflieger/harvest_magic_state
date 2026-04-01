@@ -114,7 +114,7 @@ def create_bar_plot(results, output_path):
     Y-axis: Number of timesteps
     """
     # Organize data by scheduler and layout
-    schedulers = ['Sequential', 'Packing', 'Pathfinder']
+    schedulers = ['No scheduling', 'Greedy', 'Advanced']
     layouts = ['Single Spacing', 'Large Spacing', 'Blocks of 4']
     
     data = {scheduler: {layout: None for layout in layouts} for scheduler in schedulers}
@@ -201,14 +201,13 @@ def main():
     
     # Define schedulers to test
     schedulers = [
-        {'name': 'Sequential', 'mode': 'steiner_tree'},
-        {'name': 'Packing', 'mode': 'steiner_packing'},
-        {'name': 'Pathfinder', 'mode': 'steiner_pathfinder'}
+        {'name': 'No scheduling', 'mode': 'steiner_tree'},
+        {'name': 'Greedy', 'mode': 'steiner_packing'},
+        {'name': 'Advanced', 'mode': 'steiner_pathfinder'}
     ]
     
     # Run all experiments
     logger.info(f"Starting layout comparison experiments")
-    logger.info(f"Circuit: Random 100-qubit circuit (depth 20)")
     logger.info(f"Layouts: {len(layouts)}")
     logger.info(f"Schedulers: {len(schedulers)}")
     logger.info(f"Total experiments: {len(layouts) * len(schedulers)}\n")
