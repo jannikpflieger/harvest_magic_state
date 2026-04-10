@@ -47,6 +47,8 @@ class PerformanceMetricsCollector:
         self.total_magic_terminals = 0
         self.num_time_steps = 0
         self.operations_per_timestep = []
+        # Magic-state factory metrics
+        self.magic_factory_stats = None
 
     def add_operation_result(self, success: bool, wirelength: int = 0):
         self.total_operations += 1
@@ -65,6 +67,11 @@ class PerformanceMetricsCollector:
     def set_timestep_info(self, num_steps: int, ops_per_step: List[int]):
         self.num_time_steps = num_steps
         self.operations_per_timestep = ops_per_step.copy()
+
+    def set_magic_factory_info(self, factory):
+        """Record magic-state factory statistics (if one was used)."""
+        if factory is not None:
+            self.magic_factory_stats = factory.get_stats()
 
     def calculate_final_metrics(self) -> Dict:
         metrics = {}
@@ -106,6 +113,10 @@ class PerformanceMetricsCollector:
                 'avg_operations_per_timestep': 0,
                 'max_operations_per_timestep': 0
             })
+
+        # Magic-state factory metrics
+        if self.magic_factory_stats is not None:
+            metrics['magic_factory'] = self.magic_factory_stats
 
         return metrics
 
@@ -265,6 +276,10 @@ class ComprehensiveRoutingPipeline:
             total_magic = len(processor.magic_terminals)
             used_magic = len(processor.used_magic_terminals)
             metrics_collector.set_magic_terminal_info(used_magic, total_magic)
+
+        # Magic-state factory stats
+        if hasattr(processor, 'magic_source') and processor.magic_source is not None:
+            metrics_collector.set_magic_factory_info(processor.magic_source)
 
         if hasattr(processor, 'processing_results') and processor.processing_results:
             time_step_data = {}

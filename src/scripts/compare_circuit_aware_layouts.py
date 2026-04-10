@@ -42,36 +42,54 @@ logger = logging.getLogger("CircuitAwareComparison")
 # Experiment runner
 # ------------------------------------------------------------------
 
-def run_single(dag, layout_engine, scheduler_mode, layout_label, scheduler_label):
+def run_single(dag, layout_engine, scheduler_mode, layout_label, scheduler_label,
+               magic_prep_cycles=None, factory_label="Unlimited"):
     """Route *dag* on *layout_engine* with *scheduler_mode* and return metrics dict."""
-    logger.info(f"  {layout_label} + {scheduler_label}")
+    logger.info(f"  {layout_label} + {scheduler_label} + {factory_label}")
     try:
-        processor = DAGProcessor(layout_engine=layout_engine)
+        processor = DAGProcessor(layout_engine=layout_engine, magic_prep_cycles=magic_prep_cycles)
         results = processor.process_entire_dag(dag, visualize_each_step=False, mode=scheduler_mode)
 
-        time_steps = {r["time_step"] for r in results if "time_step" in r}
-        num_timesteps = len(time_steps) if time_steps else len(results)
+        meta = getattr(processor, '_scheduling_metadata', {})
+        total_elapsed = meta.get('total_elapsed_steps', len(results))
+        completed = meta.get('completed', True)
+        nodes_completed = meta.get('num_nodes_completed', len(results))
+        nodes_total = meta.get('num_nodes_total', len(results))
 
         total_wirelength = 0
         for r in results:
             total_wirelength += len(r.get("steiner_edges", set()))
 
-        return {
+        result = {
             "layout_label": layout_label,
             "scheduler_label": scheduler_label,
+            "factory_label": factory_label,
             "scheduler_mode": scheduler_mode,
-            "num_timesteps": num_timesteps,
-            "num_nodes_processed": len(results),
+            "num_timesteps": total_elapsed,
+            "num_nodes_processed": nodes_completed,
+            "num_nodes_total": nodes_total,
+            "completed": completed,
             "total_wirelength": total_wirelength,
             "success": True,
             "magic_terminals_used": len(processor.used_magic_terminals),
             "magic_terminals_total": len(processor.magic_terminals),
         }
+
+        factory = processor.magic_source
+        if factory and not factory.unlimited:
+            stats = factory.get_stats()
+            result["magic_factory"] = stats
+            result["magic_wait_cycles"] = stats["total_wait_cycles"]
+        else:
+            result["magic_wait_cycles"] = 0
+
+        return result
     except Exception as e:
         logger.error(f"    FAILED: {e}")
         return {
             "layout_label": layout_label,
             "scheduler_label": scheduler_label,
+            "factory_label": factory_label,
             "scheduler_mode": scheduler_mode,
             "success": False,
             "error": str(e),
@@ -83,31 +101,36 @@ def run_single(dag, layout_engine, scheduler_mode, layout_label, scheduler_label
 # ------------------------------------------------------------------
 
 def create_comparison_plot(results, output_path):
-    """Bar chart: timesteps and wirelength for each (layout, scheduler) pair."""
+    """Bar chart: timesteps, wirelength, and magic wait cycles for each (layout, scheduler, factory) combo."""
     all_schedulers = sorted({r["scheduler_label"] for r in results if r["success"]})
+    factory_labels = sorted({r.get("factory_label", "Unlimited") for r in results if r["success"]})
     layout_labels = sorted({r["layout_label"] for r in results if r["success"]})
+
+    # Composite group labels: "Scheduler\nFactory"
+    group_labels = [(s, f) for s in all_schedulers for f in factory_labels]
 
     # build lookup
     lookup = {}
     for r in results:
         if r["success"]:
-            lookup[(r["layout_label"], r["scheduler_label"])] = r
+            lookup[(r["layout_label"], r["scheduler_label"], r.get("factory_label", "Unlimited"))] = r
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    for metric_idx, (metric, ylabel) in enumerate([
+    metrics = [
         ("num_timesteps", "Timesteps"),
         ("total_wirelength", "Total wirelength"),
-    ]):
-        schedulers = all_schedulers
+        ("magic_wait_cycles", "Magic wait cycles"),
+    ]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(7 * len(metrics), 6))
+
+    for metric_idx, (metric, ylabel) in enumerate(metrics):
         ax = axes[metric_idx]
-        x = np.arange(len(schedulers))
+        x = np.arange(len(group_labels))
         width = 0.8 / max(len(layout_labels), 1)
         for i, label in enumerate(layout_labels):
             vals = []
-            for sched in schedulers:
-                r = lookup.get((label, sched))
-                vals.append(r[metric] if r else 0)
+            for sched, flab in group_labels:
+                r = lookup.get((label, sched, flab))
+                vals.append(r.get(metric, 0) if r else 0)
             offset = width * (i - (len(layout_labels) - 1) / 2)
             bars = ax.bar(x + offset, vals, width, label=label, alpha=0.85)
             for bar, v in zip(bars, vals):
@@ -118,16 +141,17 @@ def create_comparison_plot(results, output_path):
                         str(int(v)),
                         ha="center",
                         va="bottom",
-                        fontsize=8,
+                        fontsize=6,
                     )
+        tick_labels = [f"{s}\n{f}" for s, f in group_labels]
         ax.set_xticks(x)
-        ax.set_xticklabels(schedulers)
+        ax.set_xticklabels(tick_labels, fontsize=7)
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
         ax.grid(axis="y", alpha=0.3, linestyle="--")
 
-    fig.suptitle("Circuit-Aware vs Baseline Layout Placement", fontweight="bold")
+    fig.suptitle("Circuit-Aware vs Baseline: Layout × Scheduler × Factory", fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
@@ -170,11 +194,18 @@ def run_comparison(dag, label, seed=42):
         ("Pathfinder", "steiner_pathfinder"),
     ]
 
+    factory_configs = [
+        ("Unlimited", None),
+        ("Prep=15", 15),
+    ]
+
     all_results = []
     for layout_label, engine in layouts:
         for sched_label, sched_mode in schedulers:
-            result = run_single(dag, engine, sched_mode, layout_label, sched_label)
-            all_results.append(result)
+            for factory_label, prep_cycles in factory_configs:
+                result = run_single(dag, engine, sched_mode, layout_label, sched_label,
+                                    magic_prep_cycles=prep_cycles, factory_label=factory_label)
+                all_results.append(result)
 
     reports = {
         "circuit_aware": {
@@ -218,12 +249,14 @@ def save_and_plot(all_results, reports, parameters, tag):
     logger.info("=" * 70)
     for r in all_results:
         if r["success"]:
+            wait_info = f", wait {r.get('magic_wait_cycles', 0):3d}" if r.get("magic_wait_cycles") else ""
+            done = "" if r.get("completed", True) else f" [INCOMPLETE {r.get('num_nodes_processed',0)}/{r.get('num_nodes_total',0)} nodes]"
             logger.info(
-                f"  {r['layout_label']:25s} + {r['scheduler_label']:18s}: "
-                f"{r['num_timesteps']:4d} steps, wirelength {r['total_wirelength']:5d}"
+                f"  {r['layout_label']:25s} + {r['scheduler_label']:18s} + {r.get('factory_label',''):10s}: "
+                f"{r['num_timesteps']:5d} steps, wirelength {r['total_wirelength']:5d}{wait_info}{done}"
             )
         else:
-            logger.info(f"  {r['layout_label']:25s} + {r['scheduler_label']:18s}: FAILED")
+            logger.info(f"  {r['layout_label']:25s} + {r['scheduler_label']:18s} + {r.get('factory_label',''):10s}: FAILED")
     logger.info("=" * 70)
 
 
