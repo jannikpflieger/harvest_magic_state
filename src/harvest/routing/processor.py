@@ -12,6 +12,7 @@ from .magic_terminal_selection import (
     get_magic_terminals,
     choose_optimal_magic_terminal,
 )
+from .magic_state_factory import MagicStateFactory
 from .scheduler import (
     process_dag_sequential,
     process_dag_with_packing,
@@ -27,7 +28,8 @@ class DAGProcessor:
     Processes DAG nodes sequentially, integrating with Steiner algorithm for magic state routing.
     """
 
-    def __init__(self, layout_rows=4, layout_cols=4, layout_engine=None):
+    def __init__(self, layout_rows=4, layout_cols=4, layout_engine=None,
+                 magic_prep_cycles=None, magic_source=None):
         """
         Initialize the DAG processor.
         
@@ -35,6 +37,12 @@ class DAGProcessor:
             layout_rows: Number of rows (used if layout_engine is None)
             layout_cols: Number of columns (used if layout_engine is None)
             layout_engine: Pre-built LayoutEngine instance (overrides layout_rows/cols)
+            magic_prep_cycles: Cooldown cycles per magic terminal after consumption.
+                ``None`` means unlimited (old behaviour where every terminal is
+                always ready).  Ignored when *magic_source* is given.
+            magic_source: A pre-built :class:`MagicStateSource` instance
+                (factory, cultivator, …).  Takes precedence over
+                *magic_prep_cycles*.
         """
         self.layout_rows = layout_rows
         self.layout_cols = layout_cols
@@ -56,6 +64,14 @@ class DAGProcessor:
         # Track magic state terminals and their usage
         self.magic_terminals = get_magic_terminals(self.ports_by_patch)
         self.used_magic_terminals = set()
+
+        # Per-terminal magic-state preparation model
+        if magic_source is not None:
+            self.magic_source = magic_source
+        elif magic_prep_cycles is not None:
+            self.magic_source = MagicStateFactory(self.magic_terminals, magic_prep_cycles)
+        else:
+            self.magic_source = None  # unlimited / old behaviour
 
         # Store results for each processed node
         self.processing_results = []
@@ -331,9 +347,20 @@ class DAGProcessor:
     # Node processing
     # ------------------------------------------------------------------
 
-    def process_dag_node(self, dag, node):
-        """Process a single DAG node: get qubit info, choose magic terminal, run Steiner."""
+    def process_dag_node(self, dag, node, ready_terminals=None):
+        """Process a single DAG node: get qubit info, choose magic terminal, run Steiner.
+
+        Args:
+            dag: The DAG circuit
+            node: The DAG node to process
+            ready_terminals: If given, restrict magic terminal choice to this set
+                (terminals whose cooldown is zero).  ``None`` means all unused
+                terminals are eligible.
+        """
         available_magic = [t for t in self.magic_terminals if t not in self.used_magic_terminals]
+        if ready_terminals is not None:
+            ready_set = set(ready_terminals)
+            available_magic = [t for t in available_magic if t in ready_set]
         if not available_magic:
             logger.warning(f"Skipping node {node.op.name} - no magic terminals available")
             return None
@@ -463,7 +490,8 @@ class DAGProcessor:
         return summary
 
 
-def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=False, mode="steiner_tree"):
+def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=False,
+                             mode="steiner_tree", magic_prep_cycles=None, magic_source=None):
     """
     Convenience function to process a DAG with Steiner algorithm integration.
 
@@ -473,11 +501,15 @@ def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=
         layout_cols: Number of columns in lattice layout
         visualize_steps: Whether to visualize each processing step
         mode: "steiner_tree", "steiner_packing", or "steiner_pathfinder"
+        magic_prep_cycles: Cooldown per terminal (None = unlimited)
+        magic_source: Pre-built MagicStateSource (overrides magic_prep_cycles)
 
     Returns:
         tuple: (DAGProcessor instance, processing results)
     """
-    processor = DAGProcessor(layout_rows, layout_cols)
+    processor = DAGProcessor(layout_rows, layout_cols,
+                             magic_prep_cycles=magic_prep_cycles,
+                             magic_source=magic_source)
 
     detailed_logger.info("Visualizing initial routing graph")
     processor.visualize_layout()

@@ -34,13 +34,68 @@ def cmd_run(args):
     dag = create_dag(pcb)
     print(f"DAG: {dag.count_ops()} ops, depth {dag.depth()}, {dag.num_qubits()} qubits")
 
-    processor, results = process_dag_with_steiner(
-        dag, layout_rows=args.rows, layout_cols=args.cols,
-        visualize_steps=args.visualize, mode=args.mode,
-    )
+    # Build magic-state source (factory, cultivation, or unlimited)
+    magic_source = None
+    source_mode = getattr(args, 'magic_source_type', 'unlimited')
+
+    if source_mode == 'factory':
+        prep_cycles = args.magic_prep_cycles
+        if prep_cycles is None:
+            prep_cycles = 15
+        print(f"Magic-state factory: {prep_cycles}-cycle cooldown per terminal")
+        # Let DAGProcessor build the factory from prep_cycles
+        processor, results = process_dag_with_steiner(
+            dag, layout_rows=args.rows, layout_cols=args.cols,
+            visualize_steps=args.visualize, mode=args.mode,
+            magic_prep_cycles=prep_cycles,
+        )
+    elif source_mode == 'cultivation':
+        from harvest.routing.magic_state_cultivator import (
+            MagicStateCultivator, geometric_sampler,
+        )
+        mean_cycles = getattr(args, 'cultivation_mean_cycles', 15) or 15
+        seed = getattr(args, 'cultivation_seed', 42) or 42
+        max_cycles = getattr(args, 'cultivation_max_cycles', None)
+        p = 1.0 / mean_cycles
+        print(f"Magic-state cultivation: geometric(p={p:.4f}), "
+              f"mean={mean_cycles} cycles, seed={seed}"
+              + (f", max={max_cycles}" if max_cycles else ""))
+        # Source will be constructed once we know the terminal list,
+        # so we build processor first with unlimited, then attach.
+        from harvest.routing.processor import DAGProcessor as _DP
+        processor = _DP(
+            layout_rows=args.rows, layout_cols=args.cols,
+        )
+        cultivator = MagicStateCultivator(
+            processor.magic_terminals,
+            geometric_sampler(p),
+            seed=seed,
+            max_cycles=max_cycles,
+        )
+        processor.magic_source = cultivator
+        results = processor.process_entire_dag(
+            dag, visualize_each_step=args.visualize, mode=args.mode,
+        )
+        processor.processing_results = results
+    else:
+        # unlimited (legacy default) — also handles --magic-prep-cycles
+        prep_cycles = args.magic_prep_cycles
+        if prep_cycles is not None:
+            print(f"Magic-state factory: {prep_cycles}-cycle cooldown per terminal")
+        processor, results = process_dag_with_steiner(
+            dag, layout_rows=args.rows, layout_cols=args.cols,
+            visualize_steps=args.visualize, mode=args.mode,
+            magic_prep_cycles=prep_cycles,
+        )
 
     print(f"Routed {len(results)} DAG nodes successfully.")
     print(processor.get_summary(args.mode))
+
+    if processor.magic_source and not processor.magic_source.unlimited:
+        stats = processor.magic_source.get_stats()
+        source_label = stats.get('source_type', 'factory')
+        print(f"Magic {source_label}: consumed={stats['total_consumed']}, "
+              f"wait_cycles={stats['total_wait_cycles']}")
 
 
 def cmd_bench(args):
@@ -170,6 +225,17 @@ def build_parser():
     p_run.add_argument("--mode", choices=["steiner_tree", "steiner_packing", "steiner_pathfinder"],
                        default="steiner_packing", help="Routing mode")
     p_run.add_argument("--visualize", action="store_true", help="Visualize each step")
+    p_run.add_argument("--magic-prep-cycles", type=int, default=None,
+                       help="Per-terminal cooldown cycles (e.g. 15 for 15-to-1). Omit for unlimited.")
+    p_run.add_argument("--magic-source-type", choices=["unlimited", "factory", "cultivation"],
+                       default="unlimited",
+                       help="Magic-state preparation model (default: unlimited)")
+    p_run.add_argument("--cultivation-mean-cycles", type=float, default=15,
+                       help="Mean cultivation readiness in cycles (default: 15)")
+    p_run.add_argument("--cultivation-seed", type=int, default=42,
+                       help="RNG seed for cultivation (default: 42)")
+    p_run.add_argument("--cultivation-max-cycles", type=int, default=None,
+                       help="Hard cap on sampled cultivation time (optional)")
 
     # --- bench ---
     p_bench = sub.add_parser("bench", help="Run depth-sweep benchmark experiment")

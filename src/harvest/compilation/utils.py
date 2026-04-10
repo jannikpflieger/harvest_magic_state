@@ -47,3 +47,12 @@ def get_pauli_type_for_qubit(node, qubit_index, all_qubits_in_operation):
                 return pauli_op
 
     return 'Z'
+
+
+def node_needs_magic_state(node) -> bool:
+    """Return True if the DAG operation node requires a magic state.
+
+    After PCB conversion every non-Clifford rotation has been absorbed into
+    a ``PauliEvolution`` gate, so checking the gate name is sufficient.
+    """
+    return getattr(node, 'op', None) is not None and node.op.name == 'PauliEvolution'
