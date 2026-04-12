@@ -271,6 +271,174 @@ def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_
     return eng
 
 
+# ---------------------------------------------------------------------------
+# Helpers for one-side / fixed-count magic placement
+# ---------------------------------------------------------------------------
+
+_SIDE_CONFIG = {
+    "top":    lambda W, H: ([(x, 0)     for x in range(1, W - 1)], "S", "mT"),
+    "bottom": lambda W, H: ([(x, H - 1) for x in range(1, W - 1)], "N", "mB"),
+    "left":   lambda W, H: ([(0, y)     for y in range(1, H - 1)], "E", "mL"),
+    "right":  lambda W, H: ([(W - 1, y) for y in range(1, H - 1)], "W", "mR"),
+}
+
+
+def _add_magic_one_side(eng, W, H, side="top"):
+    """Place magic patches along a single side of the grid (skipping corners)."""
+    if side not in _SIDE_CONFIG:
+        raise ValueError(f"side must be one of {list(_SIDE_CONFIG)}, got {side!r}")
+    positions, port_side, prefix = _SIDE_CONFIG[side](W, H)
+    for coord in positions:
+        idx = coord[0] if side in ("top", "bottom") else coord[1]
+        eng.add_patch(magic_patch_1cell(f"{prefix}{idx}", coord, side=port_side))
+
+
+def _add_magic_fixed_count(eng, W, H, num_magic, side="top"):
+    """Place exactly *num_magic* magic patches evenly along one side."""
+    if side not in _SIDE_CONFIG:
+        raise ValueError(f"side must be one of {list(_SIDE_CONFIG)}, got {side!r}")
+    positions, port_side, prefix = _SIDE_CONFIG[side](W, H)
+    available = len(positions)
+    if num_magic > available:
+        import warnings
+        warnings.warn(
+            f"Requested {num_magic} magic patches on {side} but only "
+            f"{available} positions available; capping at {available}."
+        )
+        num_magic = available
+    if num_magic <= 0:
+        return
+    # Pick evenly-spaced indices into the positions list
+    if num_magic == 1:
+        chosen = [available // 2]
+    else:
+        chosen = [round(i * (available - 1) / (num_magic - 1)) for i in range(num_magic)]
+    for ci in chosen:
+        coord = positions[ci]
+        idx = coord[0] if side in ("top", "bottom") else coord[1]
+        eng.add_patch(magic_patch_1cell(f"{prefix}{idx}", coord, side=port_side))
+
+
+# ---------------------------------------------------------------------------
+# One-side magic layouts
+# ---------------------------------------------------------------------------
+
+def nxm_one_side_magic_layout_single_qubits(
+    n: int, m: int, *, side: str = "top", swap_xz: bool = False,
+) -> LayoutEngine:
+    """
+    Same grid as ``nxm_ring_layout_single_qubits`` (single spacing, W=2n+3,
+    H=2m+3) but magic patches placed **only on one side**.
+
+    Parameters
+    ----------
+    n, m : int
+        Number of data-qubit columns / rows.
+    side : str
+        Which edge to place magic patches on: "top", "bottom", "left", "right".
+    swap_xz : bool
+        Swap X/Z port types on data patches.
+    """
+    W = 2 * n + 3
+    H = 2 * m + 3
+    eng = LayoutEngine(W, H)
+
+    qubit_idx = 0
+    for i in range(n):
+        for j in range(m):
+            x = 2 * i + 2
+            y = 2 * j + 2
+            eng.add_patch(data_patch_1cell(f"q_{qubit_idx}", (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
+
+    _add_magic_one_side(eng, W, H, side=side)
+    return eng
+
+
+def nxm_one_side_magic_layout_single_qubits_large_spacing(
+    n: int, m: int, *, side: str = "top", swap_xz: bool = False,
+) -> LayoutEngine:
+    """
+    Same grid as ``nxm_ring_layout_single_qubits_large_spacing`` (double
+    spacing, W=3n+2, H=3m+2) but magic patches placed **only on one side**.
+    """
+    W = 3 * n + 2
+    H = 3 * m + 2
+    eng = LayoutEngine(W, H)
+
+    qubit_idx = 0
+    for i in range(n):
+        for j in range(m):
+            x = 3 * i + 2
+            y = 3 * j + 2
+            eng.add_patch(data_patch_1cell(f"q_{qubit_idx}", (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
+
+    _add_magic_one_side(eng, W, H, side=side)
+    return eng
+
+
+# ---------------------------------------------------------------------------
+# Fixed-count magic layouts
+# ---------------------------------------------------------------------------
+
+def nxm_fixed_magic_count_layout_single_qubits(
+    n: int, m: int, num_magic: int, *, side: str = "top", swap_xz: bool = False,
+) -> LayoutEngine:
+    """
+    Same grid as ``nxm_ring_layout_single_qubits`` (single spacing, W=2n+3,
+    H=2m+3) but with exactly *num_magic* magic patches evenly distributed
+    along one side.
+
+    Parameters
+    ----------
+    n, m : int
+        Number of data-qubit columns / rows.
+    num_magic : int
+        Exact number of magic patches to place.
+    side : str
+        Which edge to place magic patches on: "top", "bottom", "left", "right".
+    swap_xz : bool
+        Swap X/Z port types on data patches.
+    """
+    W = 2 * n + 3
+    H = 2 * m + 3
+    eng = LayoutEngine(W, H)
+
+    qubit_idx = 0
+    for i in range(n):
+        for j in range(m):
+            x = 2 * i + 2
+            y = 2 * j + 2
+            eng.add_patch(data_patch_1cell(f"q_{qubit_idx}", (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
+
+    _add_magic_fixed_count(eng, W, H, num_magic, side=side)
+    return eng
+
+
+def nxm_fixed_magic_count_layout_single_qubits_large_spacing(
+    n: int, m: int, num_magic: int, *, side: str = "top", swap_xz: bool = False,
+) -> LayoutEngine:
+    """
+    Same grid as ``nxm_ring_layout_single_qubits_large_spacing`` (double
+    spacing, W=3n+2, H=3m+2) but with exactly *num_magic* magic patches
+    evenly distributed along one side.
+    """
+    W = 3 * n + 2
+    H = 3 * m + 2
+    eng = LayoutEngine(W, H)
+
+    qubit_idx = 0
+    for i in range(n):
+        for j in range(m):
+            x = 3 * i + 2
+            y = 3 * j + 2
+            eng.add_patch(data_patch_1cell(f"q_{qubit_idx}", (x, y), swap_xz=swap_xz))
+            qubit_idx += 1
+
+    _add_magic_fixed_count(eng, W, H, num_magic, side=side)
+    return eng
 
 
 if __name__ == "__main__":
