@@ -1,0 +1,81 @@
+{
+  "parameters": {
+    "circuit": "qaoa_barabasi_albert_N100_3reps",
+    "num_qubits": 100,
+    "factory": "Unlimited"
+  },
+  "results": [
+    {
+      "layout_label": "Single Spacing",
+      "scheduler_label": "Sequential",
+      "scheduler_mode": "steiner_tree",
+      "active_volume": 17039,
+      "num_timesteps": 2088,
+      "total_wirelength": 20215,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    },
+    {
+      "layout_label": "Single Spacing",
+      "scheduler_label": "Steiner Packing (Greedy)",
+      "scheduler_mode": "steiner_packing",
+      "active_volume": 19467,
+      "num_timesteps": 229,
+      "total_wirelength": 22643,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    },
+    {
+      "layout_label": "Double Spacing",
+      "scheduler_label": "Sequential",
+      "scheduler_mode": "steiner_tree",
+      "active_volume": 23046,
+      "num_timesteps": 2088,
+      "total_wirelength": 26222,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    },
+    {
+      "layout_label": "Double Spacing",
+      "scheduler_label": "Steiner Packing (Greedy)",
+      "scheduler_mode": "steiner_packing",
+      "active_volume": 26049,
+      "num_timesteps": 199,
+      "total_wirelength": 29225,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    },
+    {
+      "layout_label": "4 Blocks",
+      "scheduler_label": "Sequential",
+      "scheduler_mode": "steiner_tree",
+      "active_volume": 14762,
+      "num_timesteps": 2088,
+      "total_wirelength": 17938,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    },
+    {
+      "layout_label": "4 Blocks",
+      "scheduler_label": "Steiner Packing (Greedy)",
+      "scheduler_mode": "steiner_packing",
+      "active_volume": 17112,
+      "num_timesteps": 331,
+      "total_wirelength": 20288,
+      "num_nodes_processed": 2088,
+      "num_nodes_total": 2088,
+      "completed": true,
+      "success": true
+    }
+  ]
+}
