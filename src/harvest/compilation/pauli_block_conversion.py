@@ -3,9 +3,8 @@ Pauli-based Circuit Block (PCB) conversion, random circuit generation,
 DAG construction, and MQT Bench integration.
 """
 
-from qiskit import QuantumCircuit, transpile
+from qiskit import QuantumCircuit
 import numpy as np
-from qiskit.dagcircuit import DAGCircuit
 from qiskit.converters import circuit_to_dag
 from qiskit.transpiler.passes import RemoveFinalMeasurements, LitinskiTransformation
 from qiskit.transpiler import PassManager

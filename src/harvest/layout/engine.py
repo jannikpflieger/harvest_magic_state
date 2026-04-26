@@ -544,7 +544,7 @@ class LayoutEngine:
         # --- Helpers -------------------------------------------------------------
 
         def _copy_graph(g):
-            return {u: list(nbrs) for u, nbrs in g.items()}
+            return {u: list(neighbors) for u, neighbors in g.items()}
 
         def _routing_nodes_used(sol_nodes, terminals):
             # Routing cells are tuple nodes; terminals/ports may be strings (or something else).
