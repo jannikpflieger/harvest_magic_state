@@ -17,6 +17,7 @@ from .scheduler import (
     process_dag_sequential,
     process_dag_with_packing,
     process_dag_with_pathfinder,
+    process_dag_adaptive,
 )
 
 logger = logging.getLogger('HarvestMagicState.DAGProcessor')
@@ -440,6 +441,8 @@ class DAGProcessor:
             return process_dag_with_packing(self, dag, visualize_each_step)
         elif mode == "steiner_pathfinder":
             return process_dag_with_pathfinder(self, dag, visualize_each_step)
+        elif mode == "steiner_adaptive":
+            return process_dag_adaptive(self, dag, visualize_each_step=visualize_each_step)
         else:
             raise ValueError(f"Unknown processing mode: {mode}")
 

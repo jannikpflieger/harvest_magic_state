@@ -326,6 +326,146 @@ def process_dag_with_pathfinder(processor, dag, visualize_each_step=False):
     return all_results
 
 
+def process_dag_adaptive(processor, dag, low_threshold=2, high_threshold=5,
+                         visualize_each_step=False):
+    """Per-layer adaptive scheduling: select routing strategy per time step.
+
+    At each time step the number of ready (executable) nodes determines which
+    strategy is used **for that step only**:
+
+    * ``n < high_threshold`` → ``steiner_packing``
+    * ``n >= high_threshold`` → ``steiner_pathfinder``
+
+    Sequential (steiner_tree) is never used; even sparse layers use packing
+    so that at least one node is routed per step.
+
+    Args:
+        processor: DAGProcessor instance.
+        dag: The DAGCircuit to process.
+        low_threshold: Unused (kept for API compatibility).
+        high_threshold: Layer width at or above which pathfinder is used.
+        visualize_each_step: Whether to visualize each step.
+
+    Returns:
+        list: Results from processing all nodes (each result dict has a
+        ``layer_mode`` key recording which strategy was used for that step).
+    """
+    num_nodes = len(list(dag.op_nodes()))
+    logger.info(
+        f"Starting adaptive DAG processing - {num_nodes} operation nodes "
+        f"(low_threshold={low_threshold}, high_threshold={high_threshold})"
+    )
+
+    processed_nodes = set()
+    all_results = []
+    time_step = 0
+    idle_streak = 0
+    all_op_nodes = list(dag.op_nodes())
+    factory = processor.magic_source
+    mode_counts = {"steiner_tree": 0, "steiner_packing": 0, "steiner_pathfinder": 0}
+
+    while len(processed_nodes) < len(all_op_nodes):
+        logger.info(f"=== Time Step {time_step} ===")
+
+        if factory:
+            factory.tick()
+
+        processor.used_magic_terminals = set()
+
+        ready_nodes = get_ready_nodes(dag, all_op_nodes, processed_nodes)
+        if not ready_nodes:
+            logger.warning("No ready nodes found, breaking to avoid infinite loop")
+            break
+
+        ready_terminals = (
+            factory.get_ready_terminals()
+            if factory and not factory.unlimited
+            else None
+        )
+        executable_nodes = _filter_by_magic_availability(ready_nodes, factory, ready_terminals)
+
+        if not executable_nodes:
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            logger.info(
+                f"Time step {time_step}: idle (waiting for magic states, "
+                f"streak={idle_streak}, ready={factory.num_ready if factory else 'N/A'})"
+            )
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
+        idle_streak = 0
+        n = len(executable_nodes)
+
+        # --- Per-layer strategy selection ---
+        if n < high_threshold:
+            step_mode = "steiner_packing"
+        else:
+            step_mode = "steiner_pathfinder"
+
+        mode_counts[step_mode] += 1
+        logger.info(f"Time step {time_step}: {n} executable nodes → {step_mode}")
+
+        working_graph = processor.graph.copy()
+        if step_mode == "steiner_packing":
+            time_step_results = _process_time_step_with_packing(
+                processor, dag, executable_nodes, time_step, working_graph,
+                visualize_each_step, ready_terminals=ready_terminals,
+            )
+        else:
+            time_step_results = _process_time_step_with_pathfinder(
+                processor, dag, executable_nodes, time_step, working_graph,
+                visualize_each_step, ready_terminals=ready_terminals,
+            )
+
+        successful_nodes = []
+        for result in time_step_results:
+            if result["success"]:
+                result["layer_mode"] = step_mode
+                processed_nodes.add(result["node"])
+                all_results.append(result)
+                successful_nodes.append(result["node"])
+                if factory and not factory.unlimited and node_needs_magic_state(result["node"]):
+                    factory.consume(result["magic_terminal"])
+
+        successful_count = len(successful_nodes)
+        failed_count = len(time_step_results) - successful_count
+        logger.info(
+            f"Time step {time_step}: {successful_count} successful, {failed_count} failed"
+        )
+        if successful_count == 0:
+            logger.warning(f"No progress at time step {time_step} — stopping.")
+            break
+
+        time_step += 1
+
+        max_steps = num_nodes + _MAX_IDLE_CYCLES
+        if factory and not factory.unlimited:
+            prep = getattr(factory, "preparation_cycles", 50)
+            max_steps += num_nodes * prep
+        if time_step > max_steps:
+            logger.error("Too many time steps — stopping.")
+            break
+
+    logger.info(
+        f"Finished adaptive processing in {time_step} time steps. "
+        f"Processed {len(all_results)}/{num_nodes} nodes. "
+        f"Mode counts: {mode_counts}"
+    )
+    processor._scheduling_metadata = {
+        "total_elapsed_steps": time_step,
+        "num_nodes_completed": len(all_results),
+        "num_nodes_total": num_nodes,
+        "completed": len(processed_nodes) == len(all_op_nodes),
+        "adaptive_mode_counts": mode_counts,
+    }
+    return all_results
+
+
 def _filter_by_magic_availability(ready_nodes, factory, ready_terminals=None):
     """Return the subset of *ready_nodes* that can execute this cycle.
 
