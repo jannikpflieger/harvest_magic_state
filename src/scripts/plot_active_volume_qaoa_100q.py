@@ -25,7 +25,6 @@ Placement strategies (applied to each layout's grid):
 import json
 import logging
 import os
-from collections import defaultdict
 from datetime import datetime
 from typing import List, Tuple
 
@@ -52,6 +51,7 @@ from harvest.synthesis.placement import (
     baseline_placement,
 )
 from harvest.synthesis.emitter import emit_layout
+from harvest.evaluation.metrics import compute_active_volume
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,33 +110,6 @@ def template_from_layout_engine(eng: LayoutEngine, n_qubits: int,
         pairwise_distances=distances,
         site_centrality=centrality,
     )
-
-
-# ---------------------------------------------------------------------------
-# Active-volume computation
-# ---------------------------------------------------------------------------
-
-def compute_active_volume(results: list, mode: str) -> int:
-    """Compute active volume from routing result dicts.
-
-    For packing mode: group by time_step, union grid cells per step, sum sizes.
-    For sequential mode: each result is its own step, sum tuple-node counts.
-    """
-    if mode == "steiner_tree":
-        total = 0
-        for r in results:
-            for node in r.get("steiner_nodes", set()):
-                if isinstance(node, tuple):
-                    total += 1
-        return total
-
-    by_step: dict = defaultdict(set)
-    for r in results:
-        t = r.get("time_step", 0)
-        for node in r.get("steiner_nodes", set()):
-            if isinstance(node, tuple):
-                by_step[t].add(node)
-    return sum(len(cells) for cells in by_step.values())
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +228,66 @@ def create_active_volume_plot(all_results: list, output_path: str) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(layout_labels, fontsize=11)
     ax.set_ylabel("Active Volume", fontsize=11)
+    ax.legend(fontsize=10, framealpha=0.9)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    plt.savefig(output_path, bbox_inches="tight")
+    plt.close()
+    logger.info(f"Saved plot -> {output_path}")
+
+
+def create_timestep_plot(all_results: list, output_path: str) -> None:
+    """Grouped bar chart: number of timesteps per (layout, placement) pair."""
+    successful = [r for r in all_results if r["success"]]
+    if not successful:
+        logger.error("No successful results — cannot create plot.")
+        return
+
+    layout_labels = ["Single Spacing", "Double Spacing", "4 Blocks"]
+    placement_labels = ["Row-Major", "Circuit-Aware"]
+    lookup = {(r["layout_label"], r["placement_label"]): r for r in successful}
+
+    x = np.arange(len(layout_labels))
+    n_bars = len(placement_labels)
+    bar_width = 0.35
+
+    all_vals = [
+        lookup.get((l, p), {}).get("num_timesteps", 0)
+        for l in layout_labels for p in placement_labels
+    ]
+    y_max = max(all_vals) if all_vals else 1
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    for bar_idx, placement_label in enumerate(placement_labels):
+        style = PLACEMENT_STYLES[placement_label]
+        offset = (bar_idx - (n_bars - 1) / 2) * bar_width
+        values = [
+            lookup.get((layout, placement_label), {}).get("num_timesteps", 0)
+            for layout in layout_labels
+        ]
+        bars = ax.bar(
+            x + offset, values, bar_width,
+            label=placement_label,
+            color=style["color"],
+            alpha=0.88,
+            edgecolor="white",
+        )
+        for bar, val in zip(bars, values):
+            if val > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + y_max * 0.01,
+                    f"{val:,}",
+                    ha="center", va="bottom",
+                    fontsize=8, fontweight="bold",
+                )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(layout_labels, fontsize=11)
+    ax.set_ylabel("Timesteps", fontsize=11)
     ax.legend(fontsize=10, framealpha=0.9)
     ax.grid(axis="y", alpha=0.3, linestyle="--")
     ax.set_axisbelow(True)
@@ -404,6 +437,9 @@ def main() -> None:
     os.makedirs("plots", exist_ok=True)
     plot_path = f"plots/active_volume_qaoa_100q_{ts}.pdf"
     create_active_volume_plot(all_results, plot_path)
+
+    timestep_plot_path = f"plots/timesteps_qaoa_100q_{ts}.pdf"
+    create_timestep_plot(all_results, timestep_plot_path)
 
     logger.info("\nDone.")
 

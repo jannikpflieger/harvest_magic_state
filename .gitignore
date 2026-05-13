@@ -58,4 +58,7 @@ src/testTestingRootWkspc/coverageWorkspace/.coverage
 benchmark_circuits
 benchmark_circuits/**
 *.png
+*.pdf
+*.json
+*.csv
 routing_experiment_results/**
