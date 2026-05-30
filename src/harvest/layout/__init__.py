@@ -18,6 +18,8 @@ from .presets import (
     nxm_ring_layout_single_qubits_large_spacing,
 )
 
+from .pruner import prune_lattice
+
 __all__ = [
     'LayoutEngine',
     'EdgePort',
@@ -29,4 +31,5 @@ __all__ = [
     'build_7x9_magic_ring_layout',
     'nxm_ring_layout_single_qubits',
     'nxm_ring_layout_single_qubits_large_spacing',
+    'prune_lattice',
 ]

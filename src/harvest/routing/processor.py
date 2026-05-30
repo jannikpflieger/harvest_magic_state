@@ -8,6 +8,7 @@ import logging
 from collections import defaultdict
 
 from harvest.layout.presets import nxm_ring_layout_single_qubits
+from harvest.layout.pruner import prune_lattice
 from .magic_terminal_selection import (
     get_magic_terminals,
     choose_optimal_magic_terminal,
@@ -443,8 +444,68 @@ class DAGProcessor:
             return process_dag_with_pathfinder(self, dag, visualize_each_step)
         elif mode == "steiner_adaptive":
             return process_dag_adaptive(self, dag, visualize_each_step=visualize_each_step)
+        elif mode == "ilp_steiner_packing":
+            from .scheduler import process_dag_with_ilp_packing
+            from .ilp_steiner_packing import ILPConfig
+            cfg = getattr(self, "_ilp_config", ILPConfig())
+            return process_dag_with_ilp_packing(self, dag, cfg, visualize_each_step)
         else:
             raise ValueError(f"Unknown processing mode: {mode}")
+
+    def set_ilp_config(self, config) -> None:
+        """Set the ILP configuration used by the ``'ilp_steiner_packing'`` mode.
+
+        Args:
+            config: :class:`~harvest.routing.ilp_steiner_packing.ILPConfig`
+                instance to use for subsequent
+                :meth:`process_entire_dag` calls.
+        """
+        self._ilp_config = config
+
+    def prune_after_scheduling(self, results: list) -> dict:
+        """Remove unused nodes from the routing graph after scheduling.
+
+        Scans *results* (the list returned by :meth:`process_entire_dag` or any
+        scheduler variant) to determine which routing cells and patch-port nodes
+        were actually referenced during routing.  Everything else is stripped
+        from the four routing-graph data structures stored on this processor
+        instance (``graph``, ``ports_by_patch``, ``pos``,
+        ``patch_used_by_port``).
+
+        The underlying :class:`LayoutEngine` (``self.eng``) is left unchanged.
+
+        Args:
+            results: List of per-operation result dicts from scheduling.
+
+        Returns:
+            A *stats* dict with keys ``nodes_before``, ``nodes_after``,
+            ``nodes_removed``, ``routing_cells_removed``,
+            ``port_nodes_removed``, ``patches_before``, ``patches_after``.
+        """
+        (
+            self.graph,
+            self.ports_by_patch,
+            self.pos,
+            self.patch_used_by_port,
+            stats,
+        ) = prune_lattice(
+            results,
+            self.graph,
+            self.ports_by_patch,
+            self.pos,
+            self.patch_used_by_port,
+        )
+
+        logger.info(
+            "prune_after_scheduling: removed %d nodes (%d routing cells, "
+            "%d port nodes); %d → %d patches with active ports.",
+            stats["nodes_removed"],
+            stats["routing_cells_removed"],
+            stats["port_nodes_removed"],
+            stats["patches_before"],
+            stats["patches_after"],
+        )
+        return stats
 
     # ------------------------------------------------------------------
     # Utilities
@@ -494,7 +555,8 @@ class DAGProcessor:
 
 
 def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=False,
-                             mode="steiner_tree", magic_prep_cycles=None, magic_source=None):
+                             mode="steiner_tree", magic_prep_cycles=None, magic_source=None,
+                             ilp_config=None):
     """
     Convenience function to process a DAG with Steiner algorithm integration.
 
@@ -503,9 +565,12 @@ def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=
         layout_rows: Number of rows in lattice layout
         layout_cols: Number of columns in lattice layout
         visualize_steps: Whether to visualize each processing step
-        mode: "steiner_tree", "steiner_packing", or "steiner_pathfinder"
+        mode: "steiner_tree", "steiner_packing", "steiner_pathfinder", or
+            "ilp_steiner_packing"
         magic_prep_cycles: Cooldown per terminal (None = unlimited)
         magic_source: Pre-built MagicStateSource (overrides magic_prep_cycles)
+        ilp_config: Optional :class:`~harvest.routing.ilp_steiner_packing.ILPConfig`
+            for the ``'ilp_steiner_packing'`` mode.  Ignored for all other modes.
 
     Returns:
         tuple: (DAGProcessor instance, processing results)
@@ -513,6 +578,9 @@ def process_dag_with_steiner(dag, layout_rows=4, layout_cols=4, visualize_steps=
     processor = DAGProcessor(layout_rows, layout_cols,
                              magic_prep_cycles=magic_prep_cycles,
                              magic_source=magic_source)
+
+    if ilp_config is not None:
+        processor.set_ilp_config(ilp_config)
 
     detailed_logger.info("Visualizing initial routing graph")
     processor.visualize_layout()

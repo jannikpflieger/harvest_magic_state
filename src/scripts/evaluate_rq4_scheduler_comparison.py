@@ -70,8 +70,10 @@ import numpy as np
 from harvest.compilation.circuit_analysis import convert_rx_ry_to_rz, pre_prep_circuit
 from harvest.compilation.pauli_block_conversion import convert_to_PCB, create_dag
 from harvest.compilation.qasm_loader import find_qasm_files, qasm_to_circuit
+from functools import partial
 from harvest.layout.presets import (
     blocks_of_four_qubit_patches,
+    nxm_fixed_magic_count_layout_single_qubits,
     nxm_ring_layout_single_qubits,
     nxm_ring_layout_single_qubits_large_spacing,
 )
@@ -91,14 +93,15 @@ logger = logging.getLogger("RQ4")
 
 SCHEDULERS: List[Tuple[str, str]] = [
     ("steiner_tree",       "Sequential"),
-    ("steiner_packing",    "Greedy Packing"),
+    ("steiner_packing",    "Greedy"),
     ("steiner_pathfinder", "Pathfinder"),
 ]
 
 LAYOUT_PRESET_MAP = {
-    "single_spacing":  nxm_ring_layout_single_qubits,
-    "double_spacing":  nxm_ring_layout_single_qubits_large_spacing,
-    "blocks_of_four":  blocks_of_four_qubit_patches,
+    "single_spacing":         nxm_ring_layout_single_qubits,
+    "double_spacing":         nxm_ring_layout_single_qubits_large_spacing,
+    "blocks_of_four":         blocks_of_four_qubit_patches,
+    "single_spacing_8magic":  partial(nxm_fixed_magic_count_layout_single_qubits, num_magic=8),
 }
 
 # Metric keys written to CSV (raw)
@@ -356,11 +359,32 @@ def save_csv(rows: List[Dict], keys: List[str], path: Path,
 # ---------------------------------------------------------------------------
 
 SCHEDULER_COLORS = {
-    "Sequential":     "#4C72B0",
-    "Greedy Packing": "#DD8452",
-    "Pathfinder":     "#55A868",
+    "Sequential": "#4C72B0",
+    "Greedy":     "#DD8452",
+    "Pathfinder": "#55A868",
 }
-SCHEDULER_DISPLAY = ["Sequential", "Greedy Packing", "Pathfinder"]
+SCHEDULER_DISPLAY = ["Sequential", "Greedy", "Pathfinder"]
+
+
+def _display_labels(labels: List[str]) -> List[str]:
+    """Pass-through; kept for extensibility."""
+    return list(labels)
+
+
+def _direction_hint(ax, direction: str) -> None:
+    """Place direction hint above the axes box, right-aligned."""
+    if direction == "lower":
+        text = "↓ lower is better"
+    elif direction == "higher":
+        text = "↑ higher is better"
+    else:
+        return
+    # y=1.0 is the top of the axes box; use axes-fraction coordinates so the
+    # text sits just above the frame, with its right edge at the right frame edge.
+    ax.text(1.0, 1.01, text,
+            transform=ax.transAxes,
+            ha="right", va="bottom",
+            fontsize=9, color="#555555")
 
 
 def _bar_chart(
@@ -372,10 +396,11 @@ def _bar_chart(
     output_path: Path,
     annotate_direction: str = "neutral",   # "lower", "higher", or "neutral"
 ) -> None:
-    """Save a single grouped bar chart PNG."""
-    colors = [SCHEDULER_COLORS.get(l, "#888888") for l in labels]
+    """Save a single bar chart PNG."""
+    disp_labels = _display_labels(labels)
+    colors = [SCHEDULER_COLORS.get(l, "#888888") for l in disp_labels]
     fig, ax = plt.subplots(figsize=(7, 5))
-    x = np.arange(len(labels))
+    x = np.arange(len(disp_labels))
     bars = ax.bar(x, values, width=0.5, color=colors, alpha=0.88, edgecolor="white")
 
     y_max = max((v for v in values if v is not None and v > 0), default=1)
@@ -389,15 +414,10 @@ def _bar_chart(
             ha="center", va="bottom", fontsize=9, fontweight="bold",
         )
 
-    if annotate_direction == "lower":
-        ax.text(0.98, 0.97, "↓ lower is better", transform=ax.transAxes,
-                ha="right", va="top", fontsize=9, color="#555555")
-    elif annotate_direction == "higher":
-        ax.text(0.98, 0.97, "↑ higher is better", transform=ax.transAxes,
-                ha="right", va="top", fontsize=9, color="#555555")
+    _direction_hint(ax, annotate_direction)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_xticklabels(disp_labels, fontsize=11)
     ax.set_ylabel(ylabel, fontsize=11)
     ax.set_title(f"{title}\n{subtitle}", fontsize=11, fontweight="bold")
     ax.grid(axis="y", alpha=0.3, linestyle="--")
@@ -409,58 +429,68 @@ def _bar_chart(
     logger.info(f"  Saved plot -> {output_path}")
 
 
-def _normalized_comparison_plot(
+def _panel_bar(ax, labels: List[str], values: List[float],
+               ylabel: str, direction: str,
+               show_baseline: bool = False) -> None:
+    """Render a single bar-chart panel into *ax*."""
+    disp_labels = _display_labels(labels)
+    colors = [SCHEDULER_COLORS.get(l, "#888888") for l in disp_labels]
+    x = np.arange(len(disp_labels))
+    bars = ax.bar(x, values, width=0.5, color=colors, alpha=0.88, edgecolor="white")
+
+    if show_baseline:
+        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.2, alpha=0.8)
+
+    y_max = max((v for v in values if v is not None and not np.isnan(v)), default=1.5)
+    for bar, val in zip(bars, values):
+        if val is None:
+            continue
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + y_max * 0.02,
+            f"{val:.3f}" if isinstance(val, float) else f"{val:,}",
+            ha="center", va="bottom", fontsize=9, fontweight="bold",
+        )
+
+    _direction_hint(ax, direction)
+    ax.set_xticks(x)
+    ax.set_xticklabels(disp_labels, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.grid(axis="y", alpha=0.3, linestyle="--")
+    ax.set_axisbelow(True)
+
+
+def _combined_plot(
     scheduler_results: List[Dict],
     circuit_name: str,
     output_path: Path,
 ) -> None:
-    """3-panel normalized bar chart with sequential = 1.0 baseline."""
-    metrics_info = [
-        ("logical_timestep_ratio", "Timestep Ratio\n(sequential = 1.0)", "lower"),
-        ("active_volume_ratio",    "Active Volume Ratio\n(sequential = 1.0)", "lower"),
-        ("parallelism_gain",       "Parallelism Gain\n(sequential = 1.0)", "higher"),
+    """3-panel combined plot: timesteps | timestep ratio | speedup."""
+    successful = [r for r in scheduler_results if r.get("success")]
+    labels = [r["label"] for r in successful]
+
+    panels = [
+        ([r["num_time_steps"] for r in successful],
+         "Logical Timesteps", "lower", False),
+        ([r.get("logical_timestep_ratio") for r in successful],
+         "Timestep Ratio\n(sequential = 1.0)", "lower", True),
+        ([r.get("parallelism_gain") for r in successful],
+         "Speedup\n(sequential = 1.0)", "higher", True),
     ]
 
-    labels = [r["label"] for r in scheduler_results if r.get("success")]
-    n_metrics = len(metrics_info)
-    fig, axes = plt.subplots(1, n_metrics, figsize=(4.5 * n_metrics, 5), sharey=False)
-    if n_metrics == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 5), sharey=False)
+    for ax, (values, ylabel, direction, show_bl) in zip(axes, panels):
+        _panel_bar(ax, labels, values, ylabel, direction, show_baseline=show_bl)
 
-    colors = [SCHEDULER_COLORS.get(l, "#888888") for l in labels]
-    x = np.arange(len(labels))
-
-    for ax, (metric_key, ylabel, direction) in zip(axes, metrics_info):
-        values = [r.get(metric_key) for r in scheduler_results if r.get("success")]
-        ax.bar(x, values, width=0.5, color=colors, alpha=0.88, edgecolor="white")
-
-        # Baseline reference line at 1.0
-        ax.axhline(1.0, color="gray", linestyle="--", linewidth=1.2, alpha=0.8,
-                   label="sequential baseline")
-
-        y_max = max((v for v in values if v is not None), default=1.5)
-        for xi, val in zip(x, values):
-            if val is None:
-                continue
-            ax.text(xi, val + y_max * 0.02, f"{val:.3f}",
-                    ha="center", va="bottom", fontsize=9, fontweight="bold")
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=10)
-        ax.set_ylabel(ylabel, fontsize=10)
-        ax.grid(axis="y", alpha=0.3, linestyle="--")
-        ax.set_axisbelow(True)
-        hint = "↓ lower is better" if direction == "lower" else "↑ higher is better"
-        ax.text(0.98, 0.97, hint, transform=ax.transAxes,
-                ha="right", va="top", fontsize=8, color="#555555")
-
-    fig.suptitle(
-        f"RQ4 — Normalized Scheduler Comparison\n{circuit_name}",
-        fontsize=12, fontweight="bold",
-    )
+    # Shared baseline legend entry
     handles = [plt.Line2D([0], [0], color="gray", linestyle="--", linewidth=1.2)]
     fig.legend(handles, ["sequential baseline"], loc="lower center",
                ncol=1, fontsize=9, framealpha=0.9, bbox_to_anchor=(0.5, -0.04))
+
+    fig.suptitle(
+        f"RQ4 — Scheduler Comparison  |  {circuit_name}",
+        fontsize=12, fontweight="bold",
+    )
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -474,7 +504,18 @@ def generate_plots(
     output_dir: Path,
     normalize: bool,
 ) -> None:
-    """Generate all four RQ4 plots for a single circuit's results."""
+    """Generate RQ4 plots for a single circuit's results.
+
+    Individual plots
+    ----------------
+    rq4_timesteps_bar.png        – actual logical timesteps
+    rq4_timestep_ratio_bar.png   – timestep ratio (normalized, baseline = 1.0)
+    rq4_speedup_bar.png          – speedup = avg ops/step relative to sequential
+
+    Combined
+    --------
+    rq4_combined.png             – all three panels side-by-side
+    """
     successful = [r for r in scheduler_results if r.get("success")]
     if not successful:
         logger.warning("  No successful scheduler results — skipping plots.")
@@ -483,7 +524,7 @@ def generate_plots(
     labels = [r["label"] for r in successful]
     subtitle = f"Circuit: {circuit_name}"
 
-    # 1. Timesteps bar
+    # 1. Actual timesteps
     _bar_chart(
         labels,
         [r["num_time_steps"] for r in successful],
@@ -494,34 +535,36 @@ def generate_plots(
         annotate_direction="lower",
     )
 
-    # 2. Wirelength / active routing volume bar
-    _bar_chart(
-        labels,
-        [r["active_routing_volume_proxy"] for r in successful],
-        ylabel="Active Routing Volume Proxy\n(total wirelength in routing edges)",
-        title="RQ4 — Active Routing Volume Proxy by Scheduler",
-        subtitle=subtitle,
-        output_path=output_dir / "rq4_wirelength_bar.png",
-        annotate_direction="lower",
-    )
-
-    # 3. Parallelism (avg ops / timestep)
-    _bar_chart(
-        labels,
-        [r["avg_operations_per_timestep"] for r in successful],
-        ylabel="Avg. Operations per Timestep",
-        title="RQ4 — Parallelism by Scheduler",
-        subtitle=subtitle,
-        output_path=output_dir / "rq4_parallelism_bar.png",
-        annotate_direction="higher",
-    )
-
-    # 4. Normalized comparison (only if derived metrics present)
+    # 2. Timestep ratio (normalized)
     if all(r.get("logical_timestep_ratio") is not None for r in successful):
-        _normalized_comparison_plot(
+        _bar_chart(
+            labels,
+            [r["logical_timestep_ratio"] for r in successful],
+            ylabel="Timestep Ratio  (sequential = 1.0)",
+            title="RQ4 — Timestep Ratio by Scheduler",
+            subtitle=subtitle,
+            output_path=output_dir / "rq4_timestep_ratio_bar.png",
+            annotate_direction="lower",
+        )
+
+    # 3. Speedup (parallelism gain)
+    if all(r.get("parallelism_gain") is not None for r in successful):
+        _bar_chart(
+            labels,
+            [r["parallelism_gain"] for r in successful],
+            ylabel="Speedup  (sequential = 1.0)",
+            title="RQ4 — Speedup by Scheduler",
+            subtitle=subtitle,
+            output_path=output_dir / "rq4_speedup_bar.png",
+            annotate_direction="higher",
+        )
+
+    # 4. Combined 3-panel plot
+    if all(r.get("logical_timestep_ratio") is not None for r in successful):
+        _combined_plot(
             successful,
             circuit_name=circuit_name,
-            output_path=output_dir / "rq4_normalized_comparison.png",
+            output_path=output_dir / "rq4_combined.png",
         )
     elif normalize:
         logger.warning(
@@ -572,37 +615,37 @@ def generate_batch_plots(
         annotate_direction="lower",
     )
     _bar_chart(
-        labels_in_order, _means("active_routing_volume_proxy"),
-        ylabel="Avg. Active Routing Volume Proxy",
-        title="RQ4 — Avg. Active Routing Volume Proxy (Batch)",
+        labels_in_order, _means("logical_timestep_ratio"),
+        ylabel="Avg. Timestep Ratio  (sequential = 1.0)",
+        title="RQ4 — Avg. Timestep Ratio (Batch)",
         subtitle=subtitle,
-        output_path=output_dir / "rq4_wirelength_bar.png",
+        output_path=output_dir / "rq4_timestep_ratio_bar.png",
         annotate_direction="lower",
     )
     _bar_chart(
-        labels_in_order, _means("avg_operations_per_timestep"),
-        ylabel="Avg. Operations per Timestep",
-        title="RQ4 — Avg. Parallelism (Batch)",
+        labels_in_order, _means("parallelism_gain"),
+        ylabel="Avg. Speedup  (sequential = 1.0)",
+        title="RQ4 — Avg. Speedup (Batch)",
         subtitle=subtitle,
-        output_path=output_dir / "rq4_parallelism_bar.png",
+        output_path=output_dir / "rq4_speedup_bar.png",
         annotate_direction="higher",
     )
 
-    if normalize:
-        # Build pseudo-result dicts with averaged derived metrics
-        avg_results = []
-        for lbl in labels_in_order:
-            group = by_scheduler.get(lbl, [])
-            mode = group[0]["mode"] if group else lbl
-            avg = {"label": lbl, "mode": mode, "success": True}
-            for k in DERIVED_METRIC_KEYS:
-                avg[k] = _mean_safe([r.get(k) for r in group])
-            avg_results.append(avg)
-        _normalized_comparison_plot(
-            avg_results,
-            circuit_name=f"Batch average ({n_circuits} circuits)",
-            output_path=output_dir / "rq4_normalized_comparison.png",
-        )
+    # Combined 3-panel batch plot
+    avg_results = []
+    for lbl in labels_in_order:
+        group = by_scheduler.get(lbl, [])
+        mode = group[0]["mode"] if group else lbl
+        avg = {"label": lbl, "mode": mode, "success": True}
+        avg["num_time_steps"] = _mean_safe([r.get("num_time_steps") for r in group])
+        for k in DERIVED_METRIC_KEYS:
+            avg[k] = _mean_safe([r.get(k) for r in group])
+        avg_results.append(avg)
+    _combined_plot(
+        avg_results,
+        circuit_name=f"Batch average ({n_circuits} circuits)",
+        output_path=output_dir / "rq4_combined.png",
+    )
 
 
 # ---------------------------------------------------------------------------
