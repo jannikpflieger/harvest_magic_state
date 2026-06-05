@@ -674,6 +674,219 @@ def _process_time_step_with_pathfinder(processor, dag, ready_nodes, time_step, w
 
 
 # ---------------------------------------------------------------------------
+# HARVEST scheduler — Pathfinder-derived negotiated congestion with two
+# runtime-focused improvements:
+#   1. Rerouting only nets that participate in congestion.
+#   2. Early stopping when conflict-score improvement stagnates.
+# ---------------------------------------------------------------------------
+
+
+def _process_time_step_with_harvest(
+    processor, dag, ready_nodes, time_step, working_graph,
+    visualize_each_step, ready_terminals=None
+):
+    """Process one time step using the HARVEST negotiated-congestion router.
+
+    Mirrors ``_process_time_step_with_pathfinder`` but delegates to
+    ``LayoutEngine.steiner_packing_harvest`` and attaches the algorithm's
+    internal statistics to every result dict under the ``"harvest_stats"``
+    key.
+    """
+    if not ready_nodes:
+        return []
+
+    terminal_sets, node_to_terminals = _prepare_terminal_sets(
+        processor, dag, ready_nodes, ready_terminals=ready_terminals
+    )
+
+    if not terminal_sets:
+        logger.warning(f"No valid terminal sets for time step {time_step}")
+        return []
+
+    logger.info(f"Running HARVEST on {len(terminal_sets)} terminal sets")
+    packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
+        working_graph,
+        terminal_sets,
+        max_iters=4,
+        alpha=2.0,
+        beta=1.5,
+        stagnation_limit=2,
+        greedy_order="min_size",
+    )
+    logger.info(
+        f"HARVEST step {time_step}: iters={harvest_stats['iterations']}, "
+        f"conflicted_reroutes={harvest_stats['conflicted_reroutes']}, "
+        f"dropped={harvest_stats['dropped']}, "
+        f"stopped_reason={harvest_stats['stopped_reason']}"
+    )
+
+    time_step_results = _collect_time_step_results(
+        processor, ready_nodes, node_to_terminals, packing_results, time_step
+    )
+
+    # Attach HARVEST-specific metadata to every result in this time step.
+    for r in time_step_results:
+        r['harvest_stats'] = harvest_stats
+        r['algorithm'] = 'harvest'
+
+    if visualize_each_step and time_step_results:
+        successful_results = [r for r in time_step_results if r['success']]
+        if successful_results:
+            processor.eng.visualize_packing_solution(
+                working_graph, processor.pos,
+                [{'terminal_set': r['all_terminals'],
+                  'sol_nodes': r['steiner_nodes'],
+                  'sol_edges': r['steiner_edges'],
+                  'success': r['success']} for r in successful_results],
+                title=f"Time Step {time_step} (HARVEST): {len(successful_results)} nodes routed"
+            )
+
+    return time_step_results
+
+
+def process_dag_with_harvest(processor, dag, visualize_each_step=False):
+    """Process DAG using HARVEST — a Pathfinder-derived negotiated-congestion
+    scheduler with two runtime-focused improvements:
+
+    1. **Selective rerouting**: only nets that participate in congestion are
+       ripped up and rerouted each iteration, leaving conflict-free nets
+       untouched.
+
+    2. **Early stopping**: the congestion loop terminates as soon as the
+       conflict score reaches zero or fails to improve for
+       ``stagnation_limit`` consecutive iterations.
+
+    The outer loop structure (time-step management, magic-state gating,
+    dependency tracking) is identical to ``process_dag_with_pathfinder``
+    so that both algorithms are directly comparable in benchmarks.
+
+    Args:
+        processor: DAGProcessor instance.
+        dag: The DAGCircuit to process.
+        visualize_each_step: Whether to visualise each time step.
+
+    Returns:
+        list: Result dicts for every successfully routed node.  Each dict
+        contains the standard fields (``node``, ``gate_name``, ``qubits``,
+        ``time_step``, ``success``, ``magic_wait_cycles``,
+        ``magic_terminal``, ``qubit_terminals``, ``all_terminals``,
+        ``steiner_nodes``, ``steiner_edges``) plus HARVEST-only fields
+        ``"harvest_stats"`` and ``"algorithm": "harvest"``.
+    """
+    num_nodes = len(list(dag.op_nodes()))
+    logger.info(
+        f"Starting DAG processing with HARVEST - {num_nodes} operation nodes"
+    )
+
+    processed_nodes = set()
+    all_results = []
+    time_step = 0
+    idle_streak = 0
+    all_op_nodes = list(dag.op_nodes())
+    factory = processor.magic_source
+
+    while len(processed_nodes) < len(all_op_nodes):
+        logger.info(f"=== Time Step {time_step} ===")
+
+        if factory:
+            factory.tick()
+
+        processor.used_magic_terminals = set()
+
+        ready_nodes = get_ready_nodes(dag, all_op_nodes, processed_nodes)
+
+        if not ready_nodes:
+            logger.warning("No ready nodes found, breaking to avoid infinite loop")
+            break
+
+        ready_terminals = (
+            factory.get_ready_terminals()
+            if factory and not factory.unlimited
+            else None
+        )
+
+        executable_nodes = _filter_by_magic_availability(
+            ready_nodes, factory, ready_terminals
+        )
+
+        if not executable_nodes:
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            logger.info(
+                f"Time step {time_step}: idle (waiting for magic states, "
+                f"streak={idle_streak}, "
+                f"ready={factory.num_ready if factory else 'N/A'})"
+            )
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
+        idle_streak = 0
+
+        logger.info(
+            f"Found {len(executable_nodes)} executable nodes "
+            f"(of {len(ready_nodes)} ready): "
+            f"{[n.op.name for n in executable_nodes]}"
+        )
+
+        working_graph = processor.graph.copy()
+
+        time_step_results = _process_time_step_with_harvest(
+            processor, dag, executable_nodes, time_step, working_graph,
+            visualize_each_step, ready_terminals=ready_terminals,
+        )
+
+        successful_nodes = []
+        for result in time_step_results:
+            if result['success']:
+                processed_nodes.add(result['node'])
+                all_results.append(result)
+                successful_nodes.append(result['node'])
+                if factory and not factory.unlimited and node_needs_magic_state(result['node']):
+                    factory.consume(result['magic_terminal'])
+
+        successful_count = len(successful_nodes)
+        failed_count = len(time_step_results) - successful_count
+
+        logger.info(
+            f"Time step {time_step}: {successful_count} successful, "
+            f"{failed_count} failed"
+        )
+
+        if successful_count == 0:
+            logger.warning(
+                f"No progress in time step {time_step}, "
+                "remaining nodes cannot be routed"
+            )
+            break
+
+        time_step += 1
+
+        max_steps = num_nodes + _MAX_IDLE_CYCLES
+        if factory and not factory.unlimited:
+            prep = getattr(factory, 'preparation_cycles', 50)
+            max_steps += num_nodes * prep
+        if time_step > max_steps:
+            logger.error("Too many time steps - stopping")
+            break
+
+    logger.info(
+        f"Finished HARVEST processing in {time_step} time steps. "
+        f"Processed {len(all_results)}/{num_nodes} nodes successfully."
+    )
+    processor._scheduling_metadata = {
+        "total_elapsed_steps": time_step,
+        "num_nodes_completed": len(all_results),
+        "num_nodes_total": num_nodes,
+        "completed": len(processed_nodes) == len(all_op_nodes),
+    }
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # ILP-based Steiner forest packing scheduler
 # ---------------------------------------------------------------------------
 

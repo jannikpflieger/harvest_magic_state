@@ -1,40 +1,64 @@
 #!/usr/bin/env python3
 """
-Layout-type × Placement × Scheduler sweep over QAOA circuits.
+Layout-type × Placement sweep over all benchmark circuits (Greedy scheduler only).
 
-For each circuit the script runs the full cross-product of:
+For each circuit (excl. qv / chemical families) the script runs the full
+cross-product of:
   · 3 layout types  : single_spacing, double_spacing, blocks_of_four
   · 2 placements    : row_major, circuit_aware
-  · 3 schedulers    : Sequential (steiner_tree), Greedy (steiner_packing),
-                       Pathfinder (steiner_pathfinder)
-= 18 runs per circuit.
+= 6 runs per circuit (Greedy / steiner_packing only).
 
 Layout types are represented as LayoutTemplates whose data-site coordinates
 match the corresponding preset functions in harvest/layout/presets.py.
 Circuit-aware placement uses the same optimiser as StaticLayoutSynthesizer.
 Magic states are treated as unlimited (no factory).
 
-Results are written to CSV after every individual routing run so partial
-results are preserved on interrupt.
+A 3-minute (180 s) SIGALRM timeout guards each individual routing run.
+
+Outputs
+-------
+  results/layout_placement_sweep_<timestamp>/
+      summary.json
+      per_layout_rows.csv           – one row per (circuit, layout, placement)
+      circuits/
+          <n>_<family>_<circuit>.json   – per-circuit JSON
+      schedules/
+          <n>_<family>_<circuit>_<layout>_<placement>.json
+
+Results are written after every circuit so partial results are preserved on
+interrupt.
 
 Usage
 -----
     cd src
 
-    python scripts/evaluate_layout_placement_scheduler_sweep.py \\
-        --qasm-dir ../benchmark_circuits/qasm/qaoa \\
-        --output-dir ../results/layout_placement_sweep \\
-        --min-qubits 20 --max-qubits 30
+    python scripts/evaluate_layout_placement_scheduler_sweep.py
 """
+
+from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import math
+import multiprocessing
 import os
+import re
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Path bootstrap
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+_src = str(PROJECT_ROOT / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 from harvest.compilation.circuit_analysis import convert_rx_ry_to_rz, pre_prep_circuit
 from harvest.compilation.pauli_block_conversion import convert_to_PCB, create_dag
@@ -52,35 +76,47 @@ from harvest.synthesis.templates import (
     _compute_distances_and_centrality,
 )
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
 )
-logging.getLogger("HarvestMagicState.Detailed").setLevel(logging.WARNING)
-logging.getLogger("HarvestMagicState.DAGProcessor").setLevel(logging.WARNING)
 logger = logging.getLogger("LayoutPlacementSweep")
+
+for _noisy in (
+    "HarvestMagicState",
+    "HarvestMagicState.DAGProcessor",
+    "HarvestMagicState.Detailed",
+):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SCHEDULERS: List[Tuple[str, str]] = [
+# Available schedulers: (mode, label)
+ALL_SCHEDULERS: List[Tuple[str, str]] = [
     ("steiner_tree",       "Sequential"),
     ("steiner_packing",    "Greedy"),
     ("steiner_pathfinder", "Pathfinder"),
+    ("harvest",            "Harvest"),
 ]
+DEFAULT_SCHEDULERS = ["steiner_pathfinder", "steiner_tree"]
 
-PLACEMENTS = ["row_major", "circuit_aware"]
+PLACEMENTS   = ["row_major", "circuit_aware"]
 LAYOUT_TYPES = ["single_spacing", "double_spacing", "blocks_of_four"]
 
-MIN_QUBITS = 20
-MAX_QUBITS = 30
+DEFAULT_EXCLUDE_FAMILIES    = ["qv", "chemical"]
+DEFAULT_MAX_QUBITS          = 100
+DEFAULT_SCHEDULER_TIMEOUT_S = 60  # 1 minute
 
 PLACEMENT_CONFIG = PlacementConfig(alpha=1.0, beta=0.5, max_swap_iterations=100, seed=42)
 
 CSV_FIELDS = [
     "circuit_name",
+    "family",
     "num_qubits",
     "layout_type",
     "layout_grid",
@@ -94,7 +130,9 @@ CSV_FIELDS = [
     "num_nodes_processed",
     "num_nodes_total",
     "completed",
+    "runtime_s",
     "success",
+    "timed_out",
     "error",
 ]
 
@@ -228,47 +266,233 @@ def load_circuit_dag(qasm_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Single routing run
+# Timeout helper – subprocess-based hard kill (works even inside JAX/XLA)
 # ---------------------------------------------------------------------------
 
-def run_single(dag, layout_engine, scheduler_mode: str) -> Dict:
-    """Route *dag* on *layout_engine* with *scheduler_mode*; return metrics dict."""
+class _SchedulerTimeout(Exception):
+    pass
+
+
+def _run_worker(queue, dag, layout_engine, layout_type, placement, num_qubits,
+                scheduler_mode, scheduler_label):
+    """Subprocess worker: runs the routing and puts (status, ...) in queue."""
     try:
+        t0 = time.perf_counter()
         processor = DAGProcessor(layout_engine=layout_engine)
         results = processor.process_entire_dag(
             dag, visualize_each_step=False, mode=scheduler_mode
         )
+        runtime_s = time.perf_counter() - t0
 
-        meta = getattr(processor, "_scheduling_metadata", {})
-        total_elapsed   = meta.get("total_elapsed_steps",  len(results))
-        completed       = meta.get("completed",             True)
-        nodes_completed = meta.get("num_nodes_completed",   len(results))
-        nodes_total     = meta.get("num_nodes_total",       len(results))
+        meta             = getattr(processor, "_scheduling_metadata", {})
+        total_elapsed    = meta.get("total_elapsed_steps",  len(results))
+        completed        = meta.get("completed",             True)
+        nodes_completed  = meta.get("num_nodes_completed",   len(results))
+        nodes_total      = meta.get("num_nodes_total",       len(results))
         total_wirelength = sum(len(r.get("steiner_edges", set())) for r in results)
 
-        return {
+        metrics = {
+            "scheduler":           scheduler_label,
             "num_timesteps":       total_elapsed,
             "total_wirelength":    total_wirelength,
             "magic_wait_cycles":   0,
             "num_nodes_processed": nodes_completed,
             "num_nodes_total":     nodes_total,
             "completed":           completed,
+            "runtime_s":           round(runtime_s, 3),
             "success":             True,
+            "timed_out":           False,
             "error":               "",
         }
+        schedule = _build_schedule_plan(results, layout_type, placement, num_qubits)
+        queue.put(("ok", metrics, schedule))
+    except Exception as exc:  # noqa: BLE001
+        queue.put(("error", str(exc), None))
 
-    except Exception as exc:
-        logger.error(f"    FAILED: {exc}", exc_info=True)
-        return {
-            "num_timesteps":       None,
-            "total_wirelength":    None,
-            "magic_wait_cycles":   None,
-            "num_nodes_processed": None,
-            "num_nodes_total":     None,
-            "completed":           False,
-            "success":             False,
-            "error":               str(exc),
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _family_from_path(qasm_path: str, qasm_root: str) -> str:
+    try:
+        rel = Path(qasm_path).resolve().relative_to(Path(qasm_root).resolve())
+        return rel.parts[0] if rel.parts else "unknown"
+    except Exception:
+        return Path(qasm_path).parent.name
+
+
+def _safe_name(s: str) -> str:
+    """Filesystem-safe stem for per-circuit/schedule filenames."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def _qubit_idx_from_terminal(port: str) -> Optional[int]:
+    parts = port.split(":")
+    if len(parts) >= 2 and parts[1].startswith("q_"):
+        try:
+            return int(parts[1][2:])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_schedule_plan(
+    results: List[Dict],
+    layout_type: str,
+    placement: str,
+    num_qubits: int,
+) -> Dict:
+    timestep_map: Dict[int, List[Dict]] = {}
+    for r in results:
+        if not r.get("success", True):
+            continue
+        step = int(r.get("time_step", 0))
+        steiner_nodes = r.get("steiner_nodes", set())
+        routing_cells = sorted([list(n) for n in steiner_nodes if isinstance(n, tuple)])
+        port_nodes    = sorted([n for n in steiner_nodes if isinstance(n, str)])
+        qubit_terminals = r.get("qubit_terminals", [])
+        qubit_indices = sorted(set(
+            idx
+            for t in qubit_terminals
+            for idx in [_qubit_idx_from_terminal(t)]
+            if idx is not None
+        ))
+        route = {
+            "gate_name":      r.get("gate_name", ""),
+            "qubit_indices":  qubit_indices,
+            "magic_terminal": r.get("magic_terminal"),
+            "qubit_ports":    qubit_terminals,
+            "routing_cells":  routing_cells,
+            "port_nodes":     port_nodes,
         }
+        if step not in timestep_map:
+            timestep_map[step] = []
+        timestep_map[step].append(route)
+
+    timesteps = [
+        {"step": step, "routes": routes}
+        for step, routes in sorted(timestep_map.items())
+    ]
+    return {
+        "layout_type":   layout_type,
+        "placement":     placement,
+        "num_qubits":    num_qubits,
+        "num_timesteps": len(timesteps),
+        "routes_total":  sum(len(ts["routes"]) for ts in timesteps),
+        "timesteps":     timesteps,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single routing run
+# ---------------------------------------------------------------------------
+
+def run_single(
+    dag,
+    layout_engine,
+    layout_type: str,
+    placement: str,
+    num_qubits: int,
+    timeout_s: int,
+    scheduler_mode: str,
+    scheduler_label: str,
+) -> Tuple[Dict, Optional[Dict]]:
+    """
+    Route *dag* on *layout_engine* in a subprocess with a hard kill timeout.
+    Returns (metrics_dict, schedule_plan).
+    Raises _SchedulerTimeout on timeout.
+    """
+    ctx = multiprocessing.get_context("fork")
+    q: multiprocessing.Queue = ctx.Queue()
+    p = ctx.Process(
+        target=_run_worker,
+        args=(q, dag, layout_engine, layout_type, placement, num_qubits,
+              scheduler_mode, scheduler_label),
+        daemon=True,
+    )
+    p.start()
+    p.join(timeout_s)
+    if p.is_alive():
+        p.terminate()
+        p.join(3)
+        if p.is_alive():
+            p.kill()
+            p.join(2)
+        raise _SchedulerTimeout()
+    if p.exitcode != 0:
+        raise RuntimeError(f"Worker exited with code {p.exitcode}")
+    try:
+        status, metrics, schedule = q.get_nowait()
+    except Exception as exc:
+        raise RuntimeError("Worker produced no result") from exc
+    if status == "error":
+        raise RuntimeError(metrics)  # metrics holds the error string
+    return metrics, schedule
+
+
+# ---------------------------------------------------------------------------
+# Summary / checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _build_summary(
+    *,
+    ts: str,
+    qasm_dir: str,
+    exclude: set,
+    max_qubits: Optional[int],
+    qasm_files: List[str],
+    max_circuits: int,
+    circuit_docs: List[Dict],
+) -> Dict:
+    return {
+        "timestamp":                   ts,
+        "qasm_dir":                    qasm_dir,
+        "exclude_families":            sorted(exclude),
+        "max_qubits":                  max_qubits,
+        "schedulers":                  circuit_docs[0].get("schedulers", []) if circuit_docs else [],
+        "layout_types":                LAYOUT_TYPES,
+        "placements":                  PLACEMENTS,
+        "total_circuits_after_filter": len(qasm_files),
+        "max_circuits":                max_circuits,
+        "successful_circuits":         sum(1 for d in circuit_docs if d.get("status") == "success"),
+        "timed_out_circuits":          sum(1 for d in circuit_docs if d.get("status") == "timed_out"),
+        "skipped_too_large":           sum(1 for d in circuit_docs if d.get("status") == "skipped_too_large"),
+        "load_failed":                 sum(1 for d in circuit_docs if d.get("status") == "load_failed"),
+    }
+
+
+def _write_checkpoint(
+    *,
+    run_dir: Path,
+    ts: str,
+    qasm_dir: str,
+    exclude: set,
+    max_qubits: Optional[int],
+    qasm_files: List[str],
+    max_circuits: int,
+    circuit_docs: List[Dict],
+    flat_rows: List[Dict],
+) -> None:
+    """Persist current progress: summary JSON, per_circuit JSON, CSV."""
+    summary = _build_summary(
+        ts=ts,
+        qasm_dir=qasm_dir,
+        exclude=exclude,
+        max_qubits=max_qubits,
+        qasm_files=qasm_files,
+        max_circuits=max_circuits,
+        circuit_docs=circuit_docs,
+    )
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    (run_dir / "per_circuit.json").write_text(
+        json.dumps(circuit_docs, indent=2, default=str)
+    )
+    with open(run_dir / "per_layout_rows.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        for r in flat_rows:
+            w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
 
 
 # ---------------------------------------------------------------------------
@@ -276,169 +500,409 @@ def run_single(dag, layout_engine, scheduler_mode: str) -> Dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sweep layout type × placement × scheduler over QAOA circuits."
+    p = argparse.ArgumentParser(
+        description=(
+            "Sweep all benchmark circuits (excl. qv/chemical) for "
+            "layout-type × placement impact with Greedy scheduling."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
+    p.add_argument(
         "--qasm-dir",
-        default=os.path.join(
-            os.path.dirname(__file__), "..", "..", "benchmark_circuits", "qasm", "qaoa"
+        type=str,
+        default=str(PROJECT_ROOT / "benchmark_circuits" / "qasm"),
+        help="Root of benchmark QASM tree.",
+    )
+    p.add_argument(
+        "--max-qubits",
+        type=int,
+        default=DEFAULT_MAX_QUBITS,
+        help="Skip circuits with more qubits than this. 0 = no limit.",
+    )
+    p.add_argument(
+        "--min-qubits",
+        type=int,
+        default=0,
+        help="Skip circuits with fewer qubits than this. 0 = no limit.",
+    )
+    p.add_argument(
+        "--exclude-families",
+        nargs="*",
+        default=DEFAULT_EXCLUDE_FAMILIES,
+        metavar="F",
+        help="Top-level circuit families to exclude.",
+    )
+    p.add_argument(
+        "--schedulers",
+        nargs="+",
+        default=DEFAULT_SCHEDULERS,
+        choices=[m for m, _ in ALL_SCHEDULERS],
+        metavar="MODE",
+        help=(
+            "Scheduler modes to run. Choices: "
+            + ", ".join(m for m, _ in ALL_SCHEDULERS)
+            + f". Default: {DEFAULT_SCHEDULERS}"
         ),
-        help="Directory (searched recursively) for .qasm files.",
     )
-    parser.add_argument(
-        "--output-dir",
-        default=os.path.join(
-            os.path.dirname(__file__), "..", "..", "results", "layout_placement_sweep",
-        ),
-        help="Base directory for results. A timestamp (YYYYMMDD_HHMMSS) is always appended.",
+    p.add_argument(
+        "--scheduler-timeout",
+        type=int,
+        default=DEFAULT_SCHEDULER_TIMEOUT_S,
+        help="Timeout per (circuit, layout, placement, scheduler) run in seconds.",
     )
-    parser.add_argument(
-        "--min-qubits", type=int, default=None,
-        help=f"Inclusive lower qubit-count bound (default: {MIN_QUBITS}).",
+    p.add_argument(
+        "--max-circuits",
+        type=int,
+        default=0,
+        help="Process at most this many circuits after filtering (0 = all).",
     )
-    parser.add_argument(
-        "--max-qubits", type=int, default=None,
-        help=f"Inclusive upper qubit-count bound (default: {MAX_QUBITS}).",
-    )
-    parser.add_argument(
-        "--max-circuits", type=int, default=None,
-        help="Limit the number of circuits processed (useful for quick tests).",
-    )
-    parser.add_argument(
-        "--name-filter", default=None,
+    p.add_argument(
+        "--name-filter",
+        default=None,
         help="Only process circuits whose filename contains this substring.",
     )
-    args = parser.parse_args()
+    p.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(PROJECT_ROOT / "results" / "layout_placement_sweep"),
+        help="Base output path; a timestamp suffix is always appended.",
+    )
+    p.add_argument(
+        "--resume-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a previous (interrupted) run directory. "
+            "All circuits whose JSON already exists in DIR/circuits/ will be "
+            "skipped. Their rows are seeded into the new run's CSV so the "
+            "final results are complete."
+        ),
+    )
+    args = p.parse_args()
 
-    min_qubits = args.min_qubits if args.min_qubits is not None else MIN_QUBITS
-    max_qubits = args.max_qubits if args.max_qubits is not None else MAX_QUBITS
+    max_qubits = args.max_qubits if args.max_qubits > 0 else None
+    min_qubits = args.min_qubits if args.min_qubits > 0 else None
+    exclude    = set(args.exclude_families or [])
+    label_for  = {m: lbl for m, lbl in ALL_SCHEDULERS}
+    schedulers = [(m, label_for[m]) for m in args.schedulers]
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"{args.output_dir}_{ts}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "layout_placement_scheduler_sweep.csv"
+    run_dir       = Path(f"{args.output_dir}_{ts}")
+    circuits_dir  = run_dir / "circuits"
+    schedules_dir = run_dir / "schedules"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    circuits_dir.mkdir(parents=True, exist_ok=True)
+    schedules_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Collect and filter circuits ────────────────────────────────────────
-    qasm_dir = Path(args.qasm_dir)
-    all_qasm = find_qasm_files(str(qasm_dir))
+    logger.info("Output directory: %s", run_dir)
+
+    qasm_dir   = args.qasm_dir
+    qasm_files = find_qasm_files(qasm_dir)
+    qasm_files = [
+        q for q in qasm_files
+        if _family_from_path(q, qasm_dir) not in exclude
+    ]
     if args.name_filter:
-        all_qasm = [p for p in all_qasm if args.name_filter in Path(p).name]
-    logger.info(f"Found {len(all_qasm)} QASM files under {qasm_dir}")
+        qasm_files = [q for q in qasm_files if args.name_filter in Path(q).name]
+    qasm_files = sorted(qasm_files)
 
-    accepted: List[Tuple[str, object, object]] = []
-    for qasm_path in sorted(all_qasm):
+    if args.max_circuits and args.max_circuits > 0:
+        qasm_files = qasm_files[: args.max_circuits]
+
+    logger.info(
+        "Discovered %d circuits after family exclusions (%s)",
+        len(qasm_files),
+        sorted(exclude),
+    )
+
+    # ── Resume: seed results from a previous interrupted run ───────────────
+    circuit_docs: List[Dict] = []
+    flat_rows:    List[Dict] = []
+    skip_circuit_names: set = set()
+
+    if args.resume_dir:
+        resume_dir = Path(args.resume_dir)
+        old_circuits_dir = resume_dir / "circuits"
+        old_csv_path     = resume_dir / "per_layout_rows.csv"
+
+        if old_circuits_dir.is_dir():
+            for jf in sorted(old_circuits_dir.glob("*.json")):
+                try:
+                    doc = json.loads(jf.read_text())
+                    skip_circuit_names.add(doc["circuit_name"])
+                    circuit_docs.append(doc)
+                except Exception as exc:
+                    logger.warning("  resume: could not read %s: %s", jf.name, exc)
+
+        if old_csv_path.is_file():
+            with open(old_csv_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    flat_rows.append(row)
+
+        logger.info(
+            "Resume: seeded %d circuit docs and %d CSV rows from %s; skipping %d circuits.",
+            len(circuit_docs), len(flat_rows), resume_dir, len(skip_circuit_names),
+        )
+
+    for circ_idx, qasm_path in enumerate(qasm_files, 1):
+        circuit_name = Path(qasm_path).stem
+        family       = _family_from_path(qasm_path, qasm_dir)
+
+        logger.info(
+            "[%d/%d] %s  (family: %s)",
+            circ_idx, len(qasm_files), circuit_name, family,
+        )
+
+        # --- Resume: skip already-processed circuits ----------------------
+        if circuit_name in skip_circuit_names:
+            logger.info("  skipping (already in resume dir)")
+            continue
+
+        # --- Load circuit -------------------------------------------------
         try:
             circuit, dag = load_circuit_dag(qasm_path)
         except Exception as exc:
-            logger.warning(f"  Skipping {Path(qasm_path).name}: failed to load – {exc}")
-            continue
-
-        if not (min_qubits <= circuit.num_qubits <= max_qubits):
-            logger.debug(
-                f"  Skipped ({circuit.num_qubits}q, outside [{min_qubits}…{max_qubits}]): "
-                f"{Path(qasm_path).name}"
+            logger.warning("  load_failed: %s", exc)
+            circuit_doc = {
+                "circuit_name": circuit_name,
+                "family":       family,
+                "qasm_path":    qasm_path,
+                "status":       "load_failed",
+                "error":        str(exc),
+            }
+            circuit_docs.append(circuit_doc)
+            per_path = (
+                circuits_dir
+                / f"{circ_idx:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}.json"
+            )
+            per_path.write_text(json.dumps(circuit_doc, indent=2, default=str))
+            _write_checkpoint(
+                run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+                exclude=exclude, max_qubits=max_qubits,
+                qasm_files=qasm_files, max_circuits=args.max_circuits,
+                circuit_docs=circuit_docs, flat_rows=flat_rows,
             )
             continue
 
-        accepted.append((qasm_path, circuit, dag))
-        logger.info(
-            f"  Accepted: {Path(qasm_path).name}  ({circuit.num_qubits}q, "
-            f"{len(list(dag.op_nodes()))} DAG ops)"
-        )
+        num_qubits = circuit.num_qubits
 
-    if args.max_circuits is not None:
-        accepted = accepted[: args.max_circuits]
-
-    total_runs = len(accepted) * len(LAYOUT_TYPES) * len(PLACEMENTS) * len(SCHEDULERS)
-    logger.info(f"\n{'='*70}")
-    logger.info(
-        f"Processing {len(accepted)} circuits × {len(LAYOUT_TYPES)} layout types "
-        f"× {len(PLACEMENTS)} placements × {len(SCHEDULERS)} schedulers = {total_runs} total runs"
-    )
-    logger.info(f"  qubit filter : {min_qubits} … {max_qubits}")
-    logger.info(f"  layout types : {LAYOUT_TYPES}")
-    logger.info(f"  placements   : {PLACEMENTS}")
-    logger.info(f"  schedulers   : {[lbl for _, lbl in SCHEDULERS]}")
-    logger.info(f"  output CSV   : {csv_path}")
-    logger.info(f"{'='*70}\n")
-
-    # ── Open CSV and sweep ─────────────────────────────────────────────────
-    with open(csv_path, "w", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        csv_file.flush()
-
-        total_circuits = len(accepted)
-        for circ_idx, (qasm_path, circuit, dag) in enumerate(accepted, start=1):
-            circuit_name = Path(qasm_path).stem
-            num_qubits   = circuit.num_qubits
-
-            logger.info(
-                f"\n[Circuit {circ_idx}/{total_circuits}] {circuit_name}  ({num_qubits}q)"
+        if min_qubits is not None and num_qubits < min_qubits:
+            logger.info("  skipped_too_small: %dq < %d", num_qubits, min_qubits)
+            circuit_doc = {
+                "circuit_name": circuit_name,
+                "family":       family,
+                "qasm_path":    qasm_path,
+                "num_qubits":   num_qubits,
+                "status":       "skipped_too_small",
+            }
+            circuit_docs.append(circuit_doc)
+            per_path = (
+                circuits_dir
+                / f"{circ_idx:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}.json"
             )
+            per_path.write_text(json.dumps(circuit_doc, indent=2, default=str))
+            _write_checkpoint(
+                run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+                exclude=exclude, max_qubits=max_qubits,
+                qasm_files=qasm_files, max_circuits=args.max_circuits,
+                circuit_docs=circuit_docs, flat_rows=flat_rows,
+            )
+            continue
 
-            # Extract circuit summary once (used by circuit_aware placement)
+        if max_qubits is not None and num_qubits > max_qubits:
+            logger.info("  skipped_too_large: %dq > %d", num_qubits, max_qubits)
+            circuit_doc = {
+                "circuit_name": circuit_name,
+                "family":       family,
+                "qasm_path":    qasm_path,
+                "num_qubits":   num_qubits,
+                "status":       "skipped_too_large",
+            }
+            circuit_docs.append(circuit_doc)
+            per_path = (
+                circuits_dir
+                / f"{circ_idx:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}.json"
+            )
+            per_path.write_text(json.dumps(circuit_doc, indent=2, default=str))
+            _write_checkpoint(
+                run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+                exclude=exclude, max_qubits=max_qubits,
+                qasm_files=qasm_files, max_circuits=args.max_circuits,
+                circuit_docs=circuit_docs, flat_rows=flat_rows,
+            )
+            continue
+
+        # --- Extract circuit summary (for circuit_aware placement) ---------
+        try:
+            summary = extract_circuit_summary(dag)
+        except Exception as exc:
+            logger.error("  circuit summary failed: %s", exc, exc_info=True)
+            circuit_doc = {
+                "circuit_name": circuit_name,
+                "family":       family,
+                "qasm_path":    qasm_path,
+                "num_qubits":   num_qubits,
+                "status":       "summary_failed",
+                "error":        str(exc),
+            }
+            circuit_docs.append(circuit_doc)
+            per_path = (
+                circuits_dir
+                / f"{circ_idx:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}.json"
+            )
+            per_path.write_text(json.dumps(circuit_doc, indent=2, default=str))
+            _write_checkpoint(
+                run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+                exclude=exclude, max_qubits=max_qubits,
+                qasm_files=qasm_files, max_circuits=args.max_circuits,
+                circuit_docs=circuit_docs, flat_rows=flat_rows,
+            )
+            continue
+
+        circuit_result = {
+            "circuit_name": circuit_name,
+            "family":       family,
+            "qasm_path":    qasm_path,
+            "num_qubits":   num_qubits,
+            "status":       "success",
+            "schedulers":   [m for m, _ in schedulers],
+            "run_results":  [],
+        }
+
+        # --- Layout × placement sweep ------------------------------------
+        for layout_type in LAYOUT_TYPES:
+            logger.info("  layout_type: %s", layout_type)
+
             try:
-                summary = extract_circuit_summary(dag)
+                template = TEMPLATE_BUILDERS[layout_type](num_qubits)
             except Exception as exc:
-                logger.error(f"  Circuit summary extraction failed: {exc}", exc_info=True)
-                continue
-
-            # ── Layout type loop ───────────────────────────────────────────
-            for layout_type in LAYOUT_TYPES:
-                logger.info(f"  Layout type : {layout_type}")
-
-                try:
-                    template = TEMPLATE_BUILDERS[layout_type](num_qubits)
-                except Exception as exc:
-                    logger.error(f"    Template build failed: {exc}", exc_info=True)
-                    continue
-
-                layout_grid        = f"{template.grid_width}x{template.grid_height}"
-                num_magic_in_layout = len(template.magic_sites)
-                logger.info(f"    Grid: {layout_grid},  {num_magic_in_layout} magic sites")
-
-                # ── Placement loop ─────────────────────────────────────────
+                logger.error("    template build failed: %s", exc)
                 for placement_mode in PLACEMENTS:
-                    logger.info(f"    Placement   : {placement_mode}")
-
-                    try:
-                        if placement_mode == "circuit_aware":
-                            placement_result = circuit_aware_placement(
-                                summary, template, PLACEMENT_CONFIG
-                            )
-                        else:
-                            placement_result = baseline_placement(
-                                template, num_qubits, mode="row_major"
-                            )
-                        engine          = emit_layout(template, placement_result)
-                        placement_cost  = placement_result.cost
-                    except Exception as exc:
-                        logger.error(f"      Placement failed: {exc}", exc_info=True)
-                        for _, sched_label in SCHEDULERS:
-                            writer.writerow({
-                                "circuit_name":        circuit_name,
-                                "num_qubits":          num_qubits,
-                                "layout_type":         layout_type,
-                                "layout_grid":         layout_grid,
-                                "num_magic_in_layout": num_magic_in_layout,
-                                "placement":           placement_mode,
-                                "placement_cost":      None,
-                                "scheduler":           sched_label,
-                                "success":             False,
-                                "error":               str(exc),
-                            })
-                            csv_file.flush()
-                        continue
-
-                    # ── Scheduler loop ─────────────────────────────────────
-                    for sched_mode, sched_label in SCHEDULERS:
-                        logger.info(f"      Scheduler : {sched_label}")
-                        result = run_single(dag, engine, sched_mode)
-
+                    for _, sched_label in schedulers:
                         row = {
                             "circuit_name":        circuit_name,
+                            "family":              family,
+                            "num_qubits":          num_qubits,
+                            "layout_type":         layout_type,
+                            "layout_grid":         "",
+                            "num_magic_in_layout": None,
+                            "placement":           placement_mode,
+                            "placement_cost":      None,
+                            "scheduler":           sched_label,
+                            "success":             False,
+                            "timed_out":           False,
+                            "error":               f"template build: {exc}",
+                        }
+                        flat_rows.append(row)
+                        circuit_result["run_results"].append(row)
+                continue
+
+            layout_grid         = f"{template.grid_width}x{template.grid_height}"
+            num_magic_in_layout = len(template.magic_sites)
+
+            for placement_mode in PLACEMENTS:
+                logger.info("    placement: %s", placement_mode)
+
+                # Build engine from placement
+                try:
+                    if placement_mode == "circuit_aware":
+                        placement_result = circuit_aware_placement(
+                            summary, template, PLACEMENT_CONFIG
+                        )
+                    else:
+                        placement_result = baseline_placement(
+                            template, num_qubits, mode="row_major"
+                        )
+                    engine         = emit_layout(template, placement_result)
+                    placement_cost = placement_result.cost
+                except Exception as exc:
+                    logger.warning("      placement failed: %s", exc)
+                    for _, sched_label in schedulers:
+                        row = {
+                            "circuit_name":        circuit_name,
+                            "family":              family,
+                            "num_qubits":          num_qubits,
+                            "layout_type":         layout_type,
+                            "layout_grid":         layout_grid,
+                            "num_magic_in_layout": num_magic_in_layout,
+                            "placement":           placement_mode,
+                            "placement_cost":      None,
+                            "scheduler":           sched_label,
+                            "success":             False,
+                            "timed_out":           False,
+                            "error":               f"placement: {exc}",
+                        }
+                        flat_rows.append(row)
+                        circuit_result["run_results"].append(row)
+                    continue
+
+                # Route with timeout – scheduler loop
+                for sched_mode, sched_label in schedulers:
+                    logger.info("      scheduler: %s", sched_label)
+                    try:
+                        metrics, schedule = run_single(
+                            dag, engine,
+                            layout_type=layout_type,
+                            placement=placement_mode,
+                            num_qubits=num_qubits,
+                            timeout_s=args.scheduler_timeout,
+                            scheduler_mode=sched_mode,
+                            scheduler_label=sched_label,
+                        )
+                        row = {
+                            "circuit_name":        circuit_name,
+                            "family":              family,
+                            "num_qubits":          num_qubits,
+                            "layout_type":         layout_type,
+                            "layout_grid":         layout_grid,
+                            "num_magic_in_layout": num_magic_in_layout,
+                            "placement":           placement_mode,
+                            "placement_cost":      placement_cost,
+                            **metrics,
+                        }
+                        flat_rows.append(row)
+                        circuit_result["run_results"].append(row)
+
+                        # Write per-run schedule JSON
+                        if schedule is not None:
+                            schedule["circuit_name"] = circuit_name
+                            sched_name = (
+                                f"{circ_idx:04d}_{_safe_name(family)}_"
+                                f"{_safe_name(circuit_name)}_"
+                                f"{_safe_name(layout_type)}_"
+                                f"{_safe_name(placement_mode)}_"
+                                f"{_safe_name(sched_label)}.json"
+                            )
+                            (schedules_dir / sched_name).write_text(
+                                json.dumps(schedule, indent=2, default=str)
+                            )
+
+                        done_flag = (
+                            "" if metrics.get("completed", True)
+                            else (
+                                f" [INCOMPLETE "
+                                f"{metrics.get('num_nodes_processed', 0)}"
+                                f"/{metrics.get('num_nodes_total', 0)} nodes]"
+                            )
+                        )
+                        logger.info(
+                            "        → %5d steps, wirelength %5d, %.2fs%s",
+                            metrics["num_timesteps"],
+                            metrics["total_wirelength"],
+                            metrics["runtime_s"],
+                            done_flag,
+                        )
+
+                    except _SchedulerTimeout:
+                        logger.warning(
+                            "        timeout after %ds: %s / %s / %s / %s",
+                            args.scheduler_timeout,
+                            circuit_name, layout_type, placement_mode, sched_label,
+                        )
+                        row = {
+                            "circuit_name":        circuit_name,
+                            "family":              family,
                             "num_qubits":          num_qubits,
                             "layout_type":         layout_type,
                             "layout_grid":         layout_grid,
@@ -446,23 +910,63 @@ def main():
                             "placement":           placement_mode,
                             "placement_cost":      placement_cost,
                             "scheduler":           sched_label,
-                            **result,
+                            "success":             False,
+                            "timed_out":           True,
+                            "error":               f"timeout after {args.scheduler_timeout}s",
                         }
-                        writer.writerow(row)
-                        csv_file.flush()
+                        flat_rows.append(row)
+                        circuit_result["run_results"].append(row)
 
-                        if result["success"]:
-                            done = (
-                                "" if result.get("completed", True)
-                                else f" [INCOMPLETE {result.get('num_nodes_processed', 0)}"
-                                     f"/{result.get('num_nodes_total', 0)} nodes]"
-                            )
-                            logger.info(
-                                f"        → {result['num_timesteps']:5d} steps, "
-                                f"wirelength {result['total_wirelength']:5d}{done}"
-                            )
+                    except Exception as exc:
+                        logger.warning("        failed: %s", exc, exc_info=True)
+                        row = {
+                            "circuit_name":        circuit_name,
+                            "family":              family,
+                            "num_qubits":          num_qubits,
+                            "layout_type":         layout_type,
+                            "layout_grid":         layout_grid,
+                            "num_magic_in_layout": num_magic_in_layout,
+                            "placement":           placement_mode,
+                            "placement_cost":      placement_cost,
+                            "scheduler":           sched_label,
+                            "success":             False,
+                            "timed_out":           False,
+                            "error":               str(exc),
+                        }
+                        flat_rows.append(row)
+                        circuit_result["run_results"].append(row)
 
-    logger.info(f"\nDone. Results saved to {csv_path}")
+        if any(r.get("timed_out") for r in circuit_result["run_results"]):
+            circuit_result["status"] = "timed_out"
+
+        circuit_docs.append(circuit_result)
+
+        per_path = (
+            circuits_dir
+            / f"{circ_idx:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}.json"
+        )
+        per_path.write_text(json.dumps(circuit_result, indent=2, default=str))
+
+        _write_checkpoint(
+            run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+            exclude=exclude, max_qubits=max_qubits,
+            qasm_files=qasm_files, max_circuits=args.max_circuits,
+            circuit_docs=circuit_docs, flat_rows=flat_rows,
+        )
+
+    # Final checkpoint
+    _write_checkpoint(
+        run_dir=run_dir, ts=ts, qasm_dir=qasm_dir,
+        exclude=exclude, max_qubits=max_qubits,
+        qasm_files=qasm_files, max_circuits=args.max_circuits,
+        circuit_docs=circuit_docs, flat_rows=flat_rows,
+    )
+
+    logger.info("Run complete.")
+    logger.info("summary  : %s", run_dir / "summary.json")
+    logger.info("rows     : %s", run_dir / "per_layout_rows.csv")
+    logger.info("circuits : %s", circuits_dir)
+    logger.info("schedules: %s", schedules_dir)
 
 
 if __name__ == "__main__":

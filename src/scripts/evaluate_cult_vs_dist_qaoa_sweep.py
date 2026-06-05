@@ -88,10 +88,12 @@ logger = logging.getLogger("CultVsDistSweep")
 # Constants
 # ---------------------------------------------------------------------------
 
-SCHEDULERS = [
-    ("steiner_packing",    "Greedy"),
-    ("steiner_pathfinder", "Pathfinder"),
-]
+ALL_SCHEDULERS = {
+    "steiner_packing":    "Greedy",
+    "steiner_pathfinder": "Pathfinder",
+    "harvest":            "Harvest",
+}
+SCHEDULERS = list(ALL_SCHEDULERS.items())  # default: all schedulers
 
 LAYOUT_PRESET_MAP = {
     "double_spacing": nxm_ring_layout_single_qubits_large_spacing,
@@ -300,7 +302,21 @@ def main():
         default=False,
         help="Sweep num_magic from 1 up to the maximum available in the layout for each circuit.",
     )
+    parser.add_argument(
+        "--scheduler-modes",
+        nargs="+",
+        choices=list(ALL_SCHEDULERS.keys()),
+        default=None,
+        help="Scheduler mode(s) to run. Defaults to all schedulers.",
+    )
     args = parser.parse_args()
+
+    # Allow CLI to restrict schedulers
+    schedulers = (
+        [(m, ALL_SCHEDULERS[m]) for m in args.scheduler_modes]
+        if args.scheduler_modes
+        else SCHEDULERS
+    )
 
     # Allow CLI to override num_magic range (ascending when custom bounds are given)
     if args.num_magic_min is not None or args.num_magic_max is not None:
@@ -365,7 +381,7 @@ def main():
     logger.info(f"  qubit filter   : {min_qubits} … {max_qubits}")
     logger.info(f"  name filter    : {args.name_filter or '(none)'}")
     logger.info(f"  layout preset  : {args.layout_preset}")
-    logger.info(f"  schedulers     : {[lbl for _, lbl in SCHEDULERS]}")
+    logger.info(f"  schedulers     : {[lbl for _, lbl in schedulers]}")
     logger.info(f"  output CSV     : {csv_path}")
     logger.info(f"{'='*70}\n")
 
@@ -449,7 +465,7 @@ def main():
                         "mu":                  mu,
                     }
 
-                    for sched_mode, sched_label in SCHEDULERS:
+                    for sched_mode, sched_label in schedulers:
                         logger.info(f"      scheduler={sched_label}")
 
                         # Distillation — deterministic, fixed prep_cycles = mu

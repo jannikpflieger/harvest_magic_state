@@ -73,6 +73,7 @@ from harvest.layout.presets import (
     nxm_ring_layout_single_qubits_large_spacing,
 )
 from harvest.routing.processor import DAGProcessor
+from harvest.synthesis.synthesizer import StaticLayoutSynthesizer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -91,6 +92,13 @@ for _noisy in (
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
+_SCHEDULER_NAMES: Dict[str, str] = {
+    "steiner_packing": "Greedy",
+    "steiner_tree": "Sequential",
+    "steiner_pathfinder": "Pathfinder",
+    "harvest": "Harvest",
+}
+
 CSV_FIELDS = [
     "circuit_name",
     "family",
@@ -101,8 +109,10 @@ CSV_FIELDS = [
     "layout_side_single_or_double",
     "layout_side_blocks",
     "layout_total_patches",
+    "layout_named_patches",
     "layout_data_patches",
     "layout_magic_patches",
+    "layout_routing_cells",
     "patches_before_pruning",
     "patches_after_pruning",
     "patches_removed",
@@ -210,8 +220,9 @@ def run_layout_once(
     num_qubits: int,
     layout_name: str,
     scheduler_timeout_s: int,
+    scheduler_mode: str = "steiner_packing",
 ):
-    """Run one (circuit, layout) tuple with greedy scheduler and pruning."""
+    """Run one (circuit, layout, scheduler) tuple with pruning."""
     plan = auto_layout_plan(num_qubits)
 
     if layout_name == "Single Spacing":
@@ -223,6 +234,10 @@ def run_layout_once(
     elif layout_name == "Blocks of 4":
         rows = cols = plan.blocks_side
         engine = blocks_of_four_qubit_patches(rows, cols)
+    elif layout_name == "Circuit-Aware":
+        synth = StaticLayoutSynthesizer(num_lanes=1)
+        engine, _report = synth.synthesize(dag)
+        plan = auto_layout_plan(num_qubits)  # keep plan for metadata fields
     else:
         raise ValueError(f"Unknown layout: {layout_name}")
 
@@ -237,7 +252,7 @@ def run_layout_once(
         results = processor.process_entire_dag(
             dag,
             visualize_each_step=False,
-            mode="steiner_packing",
+            mode=scheduler_mode,
         )
     runtime_s = time.perf_counter() - t0
 
@@ -261,13 +276,15 @@ def run_layout_once(
 
     return {
         "layout_name": layout_name,
-        "scheduler": "Greedy",
-        "scheduler_mode": "steiner_packing",
+        "scheduler": _SCHEDULER_NAMES.get(scheduler_mode, scheduler_mode),
+        "scheduler_mode": scheduler_mode,
         "layout_side_single_or_double": plan.single_side,
         "layout_side_blocks": plan.blocks_side,
-        "layout_total_patches": len(engine.patches),
+        "layout_named_patches": len(engine.patches),
         "layout_data_patches": sum(1 for p in engine.patches.values() if p.kind != "magic"),
         "layout_magic_patches": sum(1 for p in engine.patches.values() if p.kind == "magic"),
+        "layout_routing_cells": routing_cells_before,
+        "layout_total_patches": len(engine.patches) + routing_cells_before,
         "patches_before_pruning": patches_before,
         "patches_after_pruning": patches_after,
         "patches_removed": patches_removed,
@@ -295,6 +312,7 @@ def run_layout_once(
         "num_nodes_processed": int(meta.get("num_nodes_completed", len(results))),
         "num_nodes_total": int(meta.get("num_nodes_total", len(results))),
         "completed": bool(meta.get("completed", True)),
+        "schedule_plan": _build_schedule_plan(results, layout_name, num_qubits),
     }
 
 
@@ -432,6 +450,57 @@ def plot_avg_routing_patches_removed_pct_by_layout(rows: List[Dict], out_path: P
     plt.close(fig)
 
 
+def _qubit_idx_from_terminal(port: str):
+    parts = port.split(':')
+    if len(parts) >= 2 and parts[1].startswith('q_'):
+        try:
+            return int(parts[1][2:])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_schedule_plan(results: List[Dict], layout_name: str, num_qubits: int) -> Dict:
+    timestep_map: Dict[int, List[Dict]] = {}
+    for r in results:
+        if not r.get('success', True):
+            continue
+        step = int(r.get('time_step', 0))
+        steiner_nodes = r.get('steiner_nodes', set())
+        routing_cells = sorted([list(n) for n in steiner_nodes if isinstance(n, tuple)])
+        port_nodes = sorted([n for n in steiner_nodes if isinstance(n, str)])
+        qubit_terminals = r.get('qubit_terminals', [])
+        qubit_indices = sorted(set(
+            idx
+            for t in qubit_terminals
+            for idx in [_qubit_idx_from_terminal(t)]
+            if idx is not None
+        ))
+        route = {
+            'gate_name': r.get('gate_name', ''),
+            'qubit_indices': qubit_indices,
+            'magic_terminal': r.get('magic_terminal'),
+            'qubit_ports': qubit_terminals,
+            'routing_cells': routing_cells,
+            'port_nodes': port_nodes,
+        }
+        if step not in timestep_map:
+            timestep_map[step] = []
+        timestep_map[step].append(route)
+
+    timesteps = [
+        {'step': step, 'routes': routes}
+        for step, routes in sorted(timestep_map.items())
+    ]
+    return {
+        'layout_name': layout_name,
+        'num_qubits': num_qubits,
+        'num_timesteps': len(timesteps),
+        'routes_total': sum(len(ts['routes']) for ts in timesteps),
+        'timesteps': timesteps,
+    }
+
+
 def _safe_name(s: str) -> str:
     """Filesystem-safe stem used for per-circuit JSON filenames."""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
@@ -444,16 +513,19 @@ def _build_summary(
     exclude: set,
     max_qubits: Optional[int],
     layouts: List[str],
+    scheduler_modes: List[str],
     qasm_files: List[str],
     max_circuits: int,
     circuit_docs: List[Dict],
 ) -> Dict:
+    scheduler_labels = [_SCHEDULER_NAMES.get(m, m) for m in scheduler_modes]
     return {
         "timestamp": ts,
         "qasm_dir": qasm_dir,
         "exclude_families": sorted(exclude),
         "max_qubits": max_qubits,
-        "scheduler": "Greedy (steiner_packing)",
+        "scheduler_modes": scheduler_modes,
+        "schedulers": scheduler_labels,
         "layouts": layouts,
         "total_circuits_after_family_filter": len(qasm_files),
         "max_circuits": max_circuits,
@@ -473,6 +545,7 @@ def _write_checkpoint(
     exclude: set,
     max_qubits: Optional[int],
     layouts: List[str],
+    scheduler_modes: List[str],
     qasm_files: List[str],
     max_circuits: int,
     circuit_docs: List[Dict],
@@ -485,6 +558,7 @@ def _write_checkpoint(
         exclude=exclude,
         max_qubits=max_qubits,
         layouts=layouts,
+        scheduler_modes=scheduler_modes,
         qasm_files=qasm_files,
         max_circuits=max_circuits,
         circuit_docs=circuit_docs,
@@ -576,6 +650,20 @@ def main():
         default=str(PROJECT_ROOT),
         help="Output root; script creates results/pruner_layout_sweep_<timestamp> under it.",
     )
+    p.add_argument(
+        "--scheduler-modes",
+        nargs="+",
+        default=["steiner_packing"],
+        metavar="M",
+        help="Scheduler modes to benchmark (steiner_packing, steiner_tree, steiner_pathfinder).",
+    )
+    p.add_argument(
+        "--layouts",
+        nargs="+",
+        default=["Single Spacing", "Double Spacing", "Blocks of 4"],
+        metavar="L",
+        help="Layout names to benchmark (Single Spacing, Double Spacing, Blocks of 4, Circuit-Aware).",
+    )
     args = p.parse_args()
 
     max_qubits = args.max_qubits if args.max_qubits > 0 else None
@@ -585,9 +673,11 @@ def main():
     run_dir = Path(args.out_dir) / "results" / f"pruner_layout_sweep_{ts}"
     plots_dir = run_dir / "plots"
     circuits_dir = run_dir / "circuits"
+    schedules_dir = run_dir / "schedules"
     run_dir.mkdir(parents=True, exist_ok=True)
     plots_dir.mkdir(parents=True, exist_ok=True)
     circuits_dir.mkdir(parents=True, exist_ok=True)
+    schedules_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Output directory: %s", run_dir)
 
@@ -605,7 +695,8 @@ def main():
     circuit_docs: List[Dict] = []
     flat_rows: List[Dict] = []
 
-    layouts = ["Single Spacing", "Double Spacing", "Blocks of 4"]
+    layouts = args.layouts
+    scheduler_modes = args.scheduler_modes
 
     for i, qasm_path in enumerate(qasm_files, 1):
         circuit_name = Path(qasm_path).stem
@@ -636,6 +727,7 @@ def main():
                 exclude=exclude,
                 max_qubits=max_qubits,
                 layouts=layouts,
+                scheduler_modes=scheduler_modes,
                 qasm_files=qasm_files,
                 max_circuits=args.max_circuits,
                 circuit_docs=circuit_docs,
@@ -663,6 +755,7 @@ def main():
                 exclude=exclude,
                 max_qubits=max_qubits,
                 layouts=layouts,
+                scheduler_modes=scheduler_modes,
                 qasm_files=qasm_files,
                 max_circuits=args.max_circuits,
                 circuit_docs=circuit_docs,
@@ -683,23 +776,26 @@ def main():
         circuit_start = time.perf_counter()
         timed_out_circuit = False
 
-        for layout_name in layouts:
+        combinations = [(l, s) for l in layouts for s in scheduler_modes]
+        for layout_name, scheduler_mode in combinations:
             elapsed = time.perf_counter() - circuit_start
             remaining_budget = args.circuit_timeout - elapsed
             if remaining_budget <= 0:
                 timed_out_circuit = True
                 logger.warning(
-                    "  circuit timeout reached after %.1fs, skipping remaining layouts",
+                    "  circuit timeout reached after %.1fs, skipping remaining combinations",
                     elapsed,
                 )
                 circuit_result["layout_results"].append({
                     "layout_name": layout_name,
+                    "scheduler_mode": scheduler_mode,
                     "success": False,
                     "timed_out": True,
                     "error": f"circuit timeout after {args.circuit_timeout}s",
                 })
                 break
 
+            run_label = f"{layout_name} ({_SCHEDULER_NAMES.get(scheduler_mode, scheduler_mode)})"
             layout_timeout = max(1, int(min(args.scheduler_timeout, remaining_budget)))
             try:
                 rec = run_layout_once(
@@ -707,16 +803,26 @@ def main():
                     num_qubits=num_qubits,
                     layout_name=layout_name,
                     scheduler_timeout_s=layout_timeout,
+                    scheduler_mode=scheduler_mode,
                 )
+                schedule_plan = rec.pop("schedule_plan", None)
                 rec["circuit_name"] = circuit_name
                 rec["family"] = family
                 rec["num_qubits"] = num_qubits
+                if schedule_plan is not None:
+                    schedule_plan["circuit_name"] = circuit_name
+                    layout_safe = _safe_name(run_label).lower()
+                    schedule_path = (
+                        schedules_dir
+                        / f"{i:04d}_{_safe_name(family)}_{_safe_name(circuit_name)}_{layout_safe}.json"
+                    )
+                    schedule_path.write_text(json.dumps(schedule_plan, indent=2, default=str))
                 flat_rows.append(rec)
                 circuit_result["layout_results"].append(rec)
 
                 logger.info(
-                    "  %-14s patches %d -> %d (%.1f%% removed), magic %d -> %d",
-                    layout_name,
+                    "  %-30s patches %d -> %d (%.1f%% removed), magic %d -> %d",
+                    run_label,
                     rec["patches_before_pruning"],
                     rec["patches_after_pruning"],
                     rec["patches_removed_pct"],
@@ -726,14 +832,15 @@ def main():
             except _SchedulerTimeout:
                 elapsed = time.perf_counter() - circuit_start
                 logger.warning(
-                    "  %-14s timeout after %ds (elapsed %.1fs / budget %ds)",
-                    layout_name,
+                    "  %-30s timeout after %ds (elapsed %.1fs / budget %ds)",
+                    run_label,
                     layout_timeout,
                     elapsed,
                     args.circuit_timeout,
                 )
                 circuit_result["layout_results"].append({
                     "layout_name": layout_name,
+                    "scheduler_mode": scheduler_mode,
                     "success": False,
                     "timed_out": True,
                     "error": f"timeout after {layout_timeout}s",
@@ -745,9 +852,10 @@ def main():
                     logger.warning("  circuit timeout reached; moving to next circuit")
                     break
             except Exception as exc:
-                logger.warning("  %-14s failed: %s", layout_name, exc)
+                logger.warning("  %-30s failed: %s", run_label, exc)
                 circuit_result["layout_results"].append({
                     "layout_name": layout_name,
+                    "scheduler_mode": scheduler_mode,
                     "success": False,
                     "error": str(exc),
                 })
@@ -768,6 +876,7 @@ def main():
             exclude=exclude,
             max_qubits=max_qubits,
             layouts=layouts,
+            scheduler_modes=scheduler_modes,
             qasm_files=qasm_files,
             max_circuits=args.max_circuits,
             circuit_docs=circuit_docs,
@@ -783,6 +892,7 @@ def main():
         exclude=exclude,
         max_qubits=max_qubits,
         layouts=layouts,
+        scheduler_modes=scheduler_modes,
         qasm_files=qasm_files,
         max_circuits=args.max_circuits,
         circuit_docs=circuit_docs,
