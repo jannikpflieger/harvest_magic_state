@@ -1,7 +1,3 @@
-"""
-QASM file loading and discovery utilities.
-"""
-
 import os
 import glob
 from pathlib import Path
@@ -48,7 +44,6 @@ def find_qasm_files(base_dir: str) -> List[str]:
         print(f"Directory {base_dir} does not exist!")
         return qasm_files
 
-    # Use glob to find all .qasm files recursively
     pattern = os.path.join(base_dir, "**", "*.qasm")
     qasm_files = glob.glob(pattern, recursive=True)
 

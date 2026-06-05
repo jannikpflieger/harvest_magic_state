@@ -23,7 +23,6 @@ from harvest.routing import DAGProcessor, process_dag_with_steiner
 from harvest.compilation.pauli_block_conversion import create_random_circuit, convert_to_PCB, create_dag
 from harvest.compilation.qasm_loader import qasm_to_circuit
 from harvest.compilation.circuit_analysis import analyze_single_circuit, convert_rx_ry_to_rz
-from harvest.compilation.visualizer import visualize_dag
 
 logger = logging.getLogger('ComprehensiveRoutingPipeline')
 

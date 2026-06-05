@@ -23,64 +23,6 @@ from harvest.layout.engine import LayoutEngine, magic_patch_1cell, paired_patche
 Coord = Tuple[int, int]
 
 
-def build_7x9_magic_ring_layout(
-    *,
-    start_with: str = "X",
-    swap_xz: bool = False,
-) -> LayoutEngine:
-    """
-    Build the 7x9 layout.
-
-    Args:
-        start_with: 'X' or 'Z' for the paired 2-qubit perimeter alternation
-        swap_xz: if True, swap X<->Z after alternation for the paired patches
-
-    Returns:
-        LayoutEngine populated with patches.
-    """
-    W, H = 7, 9
-    eng = LayoutEngine(W, H)
-
-    # --- Magic patches on boundary, skipping corners ---
-    # Top edge (y=0): face inward => port on 'S'
-    for x in range(1, W - 1):
-        eng.add_patch(magic_patch_1cell(f"mT{x}", (x, 0), side="S"))
-
-    # Bottom edge (y=H-1): face inward => port on 'N'
-    for x in range(1, W - 1):
-        eng.add_patch(magic_patch_1cell(f"mB{x}", (x, H - 1), side="N"))
-
-    # Left edge (x=0): face inward => port on 'E'
-    for y in range(1, H - 1):
-        eng.add_patch(magic_patch_1cell(f"mL{y}", (0, y), side="E"))
-
-    # Right edge (x=W-1): face inward => port on 'W'
-    for y in range(1, H - 1):
-        eng.add_patch(magic_patch_1cell(f"mR{y}", (W - 1, y), side="W"))
-
-    # --- 4 paired 2-qubit patches (vertical pairs) in a 2x2 arrangement ---
-    placements = [
-        ((2, 2), 0, 1),  # top-left
-        ((4, 2), 2, 3),  # top-right
-        ((2, 5), 4, 5),  # bottom-left
-        ((4, 5), 6, 7),  # bottom-right
-    ]
-
-    for (ox, oy), a, b in placements:
-        patches = paired_patches_2q_alternating(
-            name_a=f"q{a}",
-            name_b=f"q{b}",
-            origin=(ox, oy),
-            orientation="V",
-            start_with=start_with,
-            swap_xz=swap_xz,
-        )
-        for p in patches:
-            eng.add_patch(p)
-
-    return eng
-
-
 def nxm_ring_layout_single_qubits(n: int, m: int, *, start_with: str = "X", swap_xz: bool = False) -> LayoutEngine:
     """
     Build an n x m grid layout with single qubits and a ring of magic states around it.
@@ -442,20 +384,6 @@ def nxm_fixed_magic_count_layout_single_qubits_large_spacing(
 
 
 if __name__ == "__main__":
-    # Test with the existing 7x9 layout
-    #eng = build_7x9_magic_ring_layout()
-    #eng.visualize_layout("7x9 magic-ring + 4 paired 2Q patches")
-    #graph, ports_by_patch, pos, patch_used_by_port = eng.build_routing_graph()
-    #eng.visualize_graph(graph, pos, "Routing graph overlay")
-
-    
-    #eng_2x2 = nxm_ring_layout_single_qubits(10, 10)
-    #eng_2x2.visualize_layout("2x2 single-qubit layout (7x7 grid)")
-
-    #eng_5x5_large = nxm_ring_layout_single_qubits_large_spacing(5, 5)
-    #eng_5x5_large.visualize_layout("5x5 single-qubit layout with large spacing (17x17 grid)")
-    #graph, ports_by_patch, pos, patch_used_by_port = eng_5x5_large.build_routing_graph()
-    #eng_5x5_large.visualize_graph(graph, pos, "Routing graph overlay for 5x5 large spacing")
 
     eng = blocks_of_four_qubit_patches(2, 2)
     eng.visualize_layout("2x2 blocks of 4 qubits with magic ring (9x9 grid)")
