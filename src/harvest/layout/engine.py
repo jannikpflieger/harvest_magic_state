@@ -760,6 +760,353 @@ class LayoutEngine:
 
         return results, remaining_graph
 
+    # ------------------------------------------------------------------
+    # HARVEST: Pathfinder-derived negotiated-congestion with selective
+    # rerouting and early stopping.
+    # ------------------------------------------------------------------
+
+    def steiner_packing_harvest(
+        self,
+        graph,
+        terminal_sets,
+        *,
+        max_iters: int = 8,
+        alpha: float = 6.0,
+        beta: float = 1.5,
+        capacity: int = 1,
+        stagnation_limit: int = 2,
+        prune_cycles: bool = True,
+        greedy_order: str = "min_size",
+        seed: int | None = None,
+    ):
+        """HARVEST negotiated-congestion Steiner forest packer.
+
+        This is a Pathfinder-derived algorithm with two runtime-focused
+        improvements over ``steiner_packing_pathfinder``:
+
+        1. **Selective rerouting** — only nets whose current routing nodes
+           overlap with over-capacity nodes are ripped up and rerouted in
+           each iteration.  Conflict-free nets are left untouched, which
+           saves Steiner-tree calls proportional to the fraction of
+           uncontested nets.
+
+        2. **Early stopping** — the outer loop terminates as soon as the
+           conflict score (total excess capacity usage summed over all
+           routing nodes) reaches zero, *or* the score fails to improve
+           for ``stagnation_limit`` consecutive iterations.
+
+        Everything else — the node-cost model (``alpha`` × present usage +
+        ``beta`` × history), the history-penalty accumulator, the final
+        greedy-drop phase, and the remaining-graph commit — is identical to
+        ``steiner_packing_pathfinder`` so that both algorithms are
+        directly comparable in benchmarks.
+
+        Args:
+            graph: adjacency list {node: [(nbr, w), ...]}.
+            terminal_sets: list[list[node]] — one entry per net.
+            max_iters: upper bound on negotiated-congestion iterations.
+            alpha: weight for the present-congestion penalty.
+            beta: weight for the history penalty.
+            capacity: routing-node capacity (1 = node-disjoint routing cells).
+            stagnation_limit: stop early when the conflict score does not
+                improve for this many consecutive iterations.
+            prune_cycles: forwarded to ``steiner_tree``.
+            greedy_order: "min_size", "max_size", or "original".
+            seed: optional RNG seed (affects drop-phase tie-breaking only).
+
+        Returns:
+            results: list[dict] at the same positions as *terminal_sets*.
+                Each dict has the same keys as ``steiner_packing_pathfinder``
+                results plus an additional ``"harvest_stats"`` key.
+            remaining_graph: graph with committed routing nodes removed.
+            stats: lightweight dict summarising the HARVEST run::
+
+                {
+                    "iterations":           int,   # congestion iterations run
+                    "initial_routes":       int,   # nets routed in initial pass
+                    "reroutes":             int,   # total rip-up+reroute calls
+                    "conflicted_reroutes":  int,   # subset that were conflicted
+                    "dropped":              int,   # nets dropped in final phase
+                    "final_conflict_score": int,   # 0 means fully resolved
+                    "stopped_reason":       str,   # "no_conflicts" | "stagnation"
+                                                   #   | "max_iters"
+                }
+        """
+        if seed is not None:
+            random.seed(seed)
+
+        if not terminal_sets:
+            empty_stats = {
+                "iterations": 0,
+                "initial_routes": 0,
+                "reroutes": 0,
+                "conflicted_reroutes": 0,
+                "dropped": 0,
+                "final_conflict_score": 0,
+                "stopped_reason": "no_conflicts",
+            }
+            return [], dict(graph), empty_stats
+
+        # --- Helpers (shared with pathfinder) --------------------------------
+
+        def _copy_graph(g):
+            return {u: list(neighbors) for u, neighbors in g.items()}
+
+        def _routing_nodes_used(sol_nodes, terminals):
+            tset = set(terminals)
+            return {n for n in sol_nodes if isinstance(n, tuple) and n not in tset}
+
+        def _build_weighted_graph(base_graph, node_cost):
+            wg = {}
+            for u, nbrs in base_graph.items():
+                out = []
+                for v, w in nbrs:
+                    out.append((v, w + node_cost.get(v, 0.0)))
+                wg[u] = out
+            return wg
+
+        def _order_indices(sets):
+            indexed = list(enumerate(sets))
+            if greedy_order == "min_size":
+                indexed.sort(key=lambda x: len(x[1]))
+            elif greedy_order == "max_size":
+                indexed.sort(key=lambda x: len(x[1]), reverse=True)
+            return indexed
+
+        # --- State -----------------------------------------------------------
+
+        base_graph = _copy_graph(graph)
+        indexed_sets = _order_indices(terminal_sets)
+
+        routes = [None] * len(terminal_sets)
+        usage = Counter()
+        history = defaultdict(float)
+
+        # --- Stats -----------------------------------------------------------
+
+        stats_initial_routes = 0
+        stats_reroutes = 0
+        stats_conflicted_reroutes = 0
+        stats_iterations = 0
+        stopped_reason = "max_iters"
+
+        # --- Initial routing (no penalties) ----------------------------------
+
+        node_cost = {}
+        weighted_graph = _build_weighted_graph(base_graph, node_cost)
+
+        for i, terminals in indexed_sets:
+            try:
+                sol_nodes, sol_edges = self.steiner_tree(
+                    weighted_graph, terminals, prune_cycles=prune_cycles
+                )
+                routes[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": sol_nodes,
+                    "sol_edges": sol_edges,
+                    "success": True,
+                }
+                for n in _routing_nodes_used(sol_nodes, terminals):
+                    usage[n] += 1
+                stats_initial_routes += 1
+            except (ValueError, KeyError) as e:
+                routes[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": set(),
+                    "sol_edges": set(),
+                    "success": False,
+                    "error": str(e),
+                }
+
+        # --- HARVEST: selective reroute + early stopping ---------------------
+
+        best_conflict_score = None
+        stagnation_count = 0
+
+        for _it in range(max_iters):
+            conflict_score = sum(
+                max(0, c - capacity) for c in usage.values()
+            )
+
+            # Early stop: no conflicts.
+            if conflict_score == 0:
+                stopped_reason = "no_conflicts"
+                break
+
+            # Stagnation check.
+            if best_conflict_score is None:
+                best_conflict_score = conflict_score
+            elif conflict_score < best_conflict_score:
+                best_conflict_score = conflict_score
+                stagnation_count = 0
+            else:
+                stagnation_count += 1
+                if stagnation_count >= stagnation_limit:
+                    stopped_reason = "stagnation"
+                    break
+
+            stats_iterations += 1
+
+            # Identify over-capacity routing nodes.
+            overcapacity = {n for n, c in usage.items() if c > capacity}
+
+            # Reroute only nets that are conflicted (touch an over-capacity node).
+            for i, terminals in indexed_sets:
+                if not routes[i] or not routes[i].get("success", False):
+                    continue
+
+                rnodes = _routing_nodes_used(routes[i]["sol_nodes"], terminals)
+                if not rnodes.intersection(overcapacity):
+                    # Net is conflict-free — leave it untouched.
+                    continue
+
+                stats_conflicted_reroutes += 1
+                stats_reroutes += 1
+
+                # Rip up this net's contribution to usage.
+                for n in rnodes:
+                    usage[n] -= 1
+                    if usage[n] <= 0:
+                        del usage[n]
+
+                # Build node costs: present congestion + history.
+                node_cost = {}
+                for n, c in usage.items():
+                    if c > 0:
+                        node_cost[n] = node_cost.get(n, 0.0) + alpha * (c / capacity)
+                for n, h in history.items():
+                    if h > 0.0:
+                        node_cost[n] = node_cost.get(n, 0.0) + beta * h
+
+                weighted_graph = _build_weighted_graph(base_graph, node_cost)
+
+                # Reroute with updated penalties.
+                try:
+                    sol_nodes, sol_edges = self.steiner_tree(
+                        weighted_graph, terminals, prune_cycles=prune_cycles
+                    )
+                    routes[i] = {
+                        "terminal_set": terminals,
+                        "sol_nodes": sol_nodes,
+                        "sol_edges": sol_edges,
+                        "success": True,
+                    }
+                    for n in _routing_nodes_used(sol_nodes, terminals):
+                        usage[n] += 1
+                except (ValueError, KeyError) as e:
+                    routes[i] = {
+                        "terminal_set": terminals,
+                        "sol_nodes": set(),
+                        "sol_edges": set(),
+                        "success": False,
+                        "error": str(e),
+                    }
+
+            # Accumulate history for nodes still congested after this pass.
+            for n, c in usage.items():
+                if c > capacity:
+                    history[n] += (c - capacity)
+
+        # --- Final conflict resolution: drop nets until capacity respected ---
+        # (Identical to steiner_packing_pathfinder.)
+
+        def current_overfull_nodes():
+            return {n for n, c in usage.items() if c > capacity}
+
+        overfull = current_overfull_nodes()
+        dropped = set()
+
+        while overfull:
+            best_i = None
+            best_score = (-1, -1)
+
+            for i, terminals in indexed_sets:
+                if i in dropped:
+                    continue
+                if not routes[i] or not routes[i].get("success", False):
+                    continue
+
+                rnodes = _routing_nodes_used(routes[i]["sol_nodes"], terminals)
+                conflict_count = sum(1 for n in rnodes if n in overfull)
+                route_size = len(rnodes)
+
+                score = (conflict_count, route_size)
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+
+            if best_i is None or best_score[0] <= 0:
+                break
+
+            terminals = routes[best_i]["terminal_set"]
+            rnodes = _routing_nodes_used(routes[best_i]["sol_nodes"], terminals)
+            for n in rnodes:
+                usage[n] -= 1
+                if usage[n] <= 0:
+                    del usage[n]
+
+            dropped.add(best_i)
+            overfull = current_overfull_nodes()
+
+        # --- Build outputs and remaining graph (commit packed nets) ----------
+
+        remaining_graph = _copy_graph(base_graph)
+        packed_routing_nodes = set()
+        results = [None] * len(terminal_sets)
+
+        final_conflict_score = sum(max(0, c - capacity) for c in usage.values())
+
+        for i, terminals in enumerate(terminal_sets):
+            r = routes[i] if routes[i] is not None else {
+                "terminal_set": terminals,
+                "sol_nodes": set(),
+                "sol_edges": set(),
+                "success": False,
+                "error": "unrouted",
+            }
+
+            if r.get("success", False) and i not in dropped:
+                rnodes = _routing_nodes_used(r["sol_nodes"], terminals)
+                packed_routing_nodes |= rnodes
+                results[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": r["sol_nodes"],
+                    "sol_edges": r["sol_edges"],
+                    "success": True,
+                }
+            else:
+                err = r.get(
+                    "error",
+                    "dropped due to congestion" if i in dropped else "unrouted",
+                )
+                results[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": set(),
+                    "sol_edges": set(),
+                    "success": False,
+                    "error": err,
+                }
+
+        for n in packed_routing_nodes:
+            if n in remaining_graph:
+                del remaining_graph[n]
+        for u in list(remaining_graph.keys()):
+            remaining_graph[u] = [
+                (v, w) for (v, w) in remaining_graph[u]
+                if v not in packed_routing_nodes
+            ]
+
+        stats = {
+            "iterations": stats_iterations,
+            "initial_routes": stats_initial_routes,
+            "reroutes": stats_reroutes,
+            "conflicted_reroutes": stats_conflicted_reroutes,
+            "dropped": len(dropped),
+            "final_conflict_score": final_conflict_score,
+            "stopped_reason": stopped_reason,
+        }
+
+        return results, remaining_graph, stats
 
     def visualize_packing_solution(self, graph, pos, packing_results, *, title="Steiner Packing Solution", only_used=True):
         _viz.visualize_packing_solution(self, graph, pos, packing_results, title=title, only_used=only_used)

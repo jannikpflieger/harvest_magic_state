@@ -34,6 +34,16 @@ def cmd_run(args):
     dag = create_dag(pcb)
     print(f"DAG: {dag.count_ops()} ops, depth {dag.depth()}, {dag.num_qubits()} qubits")
 
+    # Build ILP config if the user selected the ILP mode.
+    _ilp_config = None
+    if getattr(args, 'mode', None) == 'ilp_steiner_packing':
+        from harvest.routing.ilp_steiner_packing import ILPConfig
+        _ilp_config = ILPConfig(
+            time_limit_ms=getattr(args, 'ilp_time_limit_ms', 3000),
+            max_ready_products=getattr(args, 'ilp_max_ready', 20),
+            max_magic_candidates=getattr(args, 'ilp_max_magic_candidates', 8),
+        )
+
     # Build magic-state source (factory, cultivation, or unlimited)
     magic_source = None
     source_mode = getattr(args, 'magic_source_type', 'unlimited')
@@ -48,6 +58,7 @@ def cmd_run(args):
             dag, layout_rows=args.rows, layout_cols=args.cols,
             visualize_steps=args.visualize, mode=args.mode,
             magic_prep_cycles=prep_cycles,
+            ilp_config=_ilp_config,
         )
     elif source_mode == 'cultivation':
         from harvest.routing.magic_state_cultivator import (
@@ -73,6 +84,8 @@ def cmd_run(args):
             max_cycles=max_cycles,
         )
         processor.magic_source = cultivator
+        if _ilp_config is not None:
+            processor.set_ilp_config(_ilp_config)
         results = processor.process_entire_dag(
             dag, visualize_each_step=args.visualize, mode=args.mode,
         )
@@ -86,6 +99,7 @@ def cmd_run(args):
             dag, layout_rows=args.rows, layout_cols=args.cols,
             visualize_steps=args.visualize, mode=args.mode,
             magic_prep_cycles=prep_cycles,
+            ilp_config=_ilp_config,
         )
 
     print(f"Routed {len(results)} DAG nodes successfully.")
@@ -222,8 +236,41 @@ def build_parser():
     p_run.add_argument("--seed", type=int, default=42, help="Random seed")
     p_run.add_argument("--rows", type=int, default=5, help="Layout rows")
     p_run.add_argument("--cols", type=int, default=5, help="Layout columns")
-    p_run.add_argument("--mode", choices=["steiner_tree", "steiner_packing", "steiner_pathfinder"],
-                       default="steiner_packing", help="Routing mode")
+    p_run.add_argument(
+        "--mode",
+        choices=[
+            "steiner_tree",
+            "steiner_packing",
+            "steiner_pathfinder",
+            "ilp_steiner_packing",
+        ],
+        default="steiner_packing",
+        help="Routing mode (default: steiner_packing)",
+    )
+    p_run.add_argument(
+        "--ilp-time-limit-ms",
+        type=int,
+        default=3000,
+        help="ILP solver wall-clock budget in ms (ilp_steiner_packing only, default: 3000)",
+    )
+    p_run.add_argument(
+        "--ilp-max-ready",
+        type=int,
+        default=20,
+        help=(
+            "Max ready products before ILP falls back to greedy "
+            "(ilp_steiner_packing only, default: 20)"
+        ),
+    )
+    p_run.add_argument(
+        "--ilp-max-magic-candidates",
+        type=int,
+        default=8,
+        help=(
+            "Max magic-state candidates per product in ILP "
+            "(ilp_steiner_packing only, default: 8)"
+        ),
+    )
     p_run.add_argument("--visualize", action="store_true", help="Visualize each step")
     p_run.add_argument("--magic-prep-cycles", type=int, default=None,
                        help="Per-terminal cooldown cycles (e.g. 15 for 15-to-1). Omit for unlimited.")

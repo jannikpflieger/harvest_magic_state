@@ -12,6 +12,7 @@ Layout: Single space with magic states all around
 """
 
 import json
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -126,6 +127,32 @@ def load_all_algorithm_data(base_path):
     return data
 
 
+def save_comparison_csv(data, output_path_csv):
+    """Save the extracted timestep comparison data to CSV."""
+    algorithms = list(data.keys())
+    rows = []
+
+    for algorithm in algorithms:
+        sequential = data[algorithm]['sequential']
+        greedy = data[algorithm]['greedy']
+        rows.append({
+            'algorithm': algorithm,
+            'sequential_timesteps': sequential,
+            'greedy_timesteps': greedy,
+            'speedup': sequential / greedy if greedy else None,
+        })
+
+    with open(output_path_csv, 'w', newline='') as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=['algorithm', 'sequential_timesteps', 'greedy_timesteps', 'speedup']
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"CSV saved to {output_path_csv}")
+
+
 def create_comparison_plot(data, output_path_png, output_path_pdf=None):
     """
     Create grouped bar chart comparing sequential vs greedy packing.
@@ -216,9 +243,11 @@ def main():
     
     output_path_png = output_dir / 'algorithm_comparison_timesteps.png'
     output_path_pdf = output_dir / 'algorithm_comparison_timesteps.pdf'
+    output_path_csv = output_dir / 'algorithm_comparison_timesteps.csv'
     
     print(f"\nGenerating plot...")
     create_comparison_plot(data, str(output_path_png), str(output_path_pdf))
+    save_comparison_csv(data, str(output_path_csv))
     print("Done!")
 
 

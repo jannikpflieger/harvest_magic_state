@@ -507,12 +507,24 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
     node_to_terminals = {}
     temp_used_magic = processor.used_magic_terminals.copy()
 
+    # Unlimited mode (no magic source or unlimited source) should not enforce
+    # one-time terminal usage within a time step. Otherwise dense layers can
+    # spuriously report "No magic terminals available" even though magic is
+    # configured as always available.
+    factory = getattr(processor, "magic_source", None)
+    enforce_unique_magic = not (factory is None or getattr(factory, "unlimited", False))
+
     for node in ready_nodes:
-        available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
-        if ready_terminals is not None:
-            ready_set = set(ready_terminals)
-            available_magic = [t for t in available_magic if t in ready_set]
+        if enforce_unique_magic:
+            available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
+            if ready_terminals is not None:
+                ready_set = set(ready_terminals)
+                available_magic = [t for t in available_magic if t in ready_set]
+        else:
+            available_magic = list(processor.magic_terminals)
+
         if not available_magic:
+            # This can happen only in constrained mode.
             logger.warning(f"No magic terminals available for node {node.op.name}")
             continue
 
@@ -530,11 +542,13 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
             logger.warning(f"No suitable magic terminal found for node {node.op.name}")
             continue
 
-        temp_used_magic.add(magic_terminal)
+        if enforce_unique_magic:
+            temp_used_magic.add(magic_terminal)
 
         qubit_terminals = processor._get_qubit_terminals_with_magic_direction(dag, node, magic_terminal)
         if not qubit_terminals:
-            temp_used_magic.remove(magic_terminal)
+            if enforce_unique_magic and magic_terminal in temp_used_magic:
+                temp_used_magic.remove(magic_terminal)
             continue
 
         terminals = [magic_terminal] + qubit_terminals
@@ -657,3 +671,496 @@ def _process_time_step_with_pathfinder(processor, dag, ready_nodes, time_step, w
             )
 
     return time_step_results
+
+
+# ---------------------------------------------------------------------------
+# HARVEST scheduler — Pathfinder-derived negotiated congestion with two
+# runtime-focused improvements:
+#   1. Rerouting only nets that participate in congestion.
+#   2. Early stopping when conflict-score improvement stagnates.
+# ---------------------------------------------------------------------------
+
+
+def _process_time_step_with_harvest(
+    processor, dag, ready_nodes, time_step, working_graph,
+    visualize_each_step, ready_terminals=None
+):
+    """Process one time step using the HARVEST negotiated-congestion router.
+
+    Mirrors ``_process_time_step_with_pathfinder`` but delegates to
+    ``LayoutEngine.steiner_packing_harvest`` and attaches the algorithm's
+    internal statistics to every result dict under the ``"harvest_stats"``
+    key.
+    """
+    if not ready_nodes:
+        return []
+
+    terminal_sets, node_to_terminals = _prepare_terminal_sets(
+        processor, dag, ready_nodes, ready_terminals=ready_terminals
+    )
+
+    if not terminal_sets:
+        logger.warning(f"No valid terminal sets for time step {time_step}")
+        return []
+
+    logger.info(f"Running HARVEST on {len(terminal_sets)} terminal sets")
+    packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
+        working_graph,
+        terminal_sets,
+        max_iters=4,
+        alpha=2.0,
+        beta=1.5,
+        stagnation_limit=2,
+        greedy_order="min_size",
+    )
+    logger.info(
+        f"HARVEST step {time_step}: iters={harvest_stats['iterations']}, "
+        f"conflicted_reroutes={harvest_stats['conflicted_reroutes']}, "
+        f"dropped={harvest_stats['dropped']}, "
+        f"stopped_reason={harvest_stats['stopped_reason']}"
+    )
+
+    time_step_results = _collect_time_step_results(
+        processor, ready_nodes, node_to_terminals, packing_results, time_step
+    )
+
+    # Attach HARVEST-specific metadata to every result in this time step.
+    for r in time_step_results:
+        r['harvest_stats'] = harvest_stats
+        r['algorithm'] = 'harvest'
+
+    if visualize_each_step and time_step_results:
+        successful_results = [r for r in time_step_results if r['success']]
+        if successful_results:
+            processor.eng.visualize_packing_solution(
+                working_graph, processor.pos,
+                [{'terminal_set': r['all_terminals'],
+                  'sol_nodes': r['steiner_nodes'],
+                  'sol_edges': r['steiner_edges'],
+                  'success': r['success']} for r in successful_results],
+                title=f"Time Step {time_step} (HARVEST): {len(successful_results)} nodes routed"
+            )
+
+    return time_step_results
+
+
+def process_dag_with_harvest(processor, dag, visualize_each_step=False):
+    """Process DAG using HARVEST — a Pathfinder-derived negotiated-congestion
+    scheduler with two runtime-focused improvements:
+
+    1. **Selective rerouting**: only nets that participate in congestion are
+       ripped up and rerouted each iteration, leaving conflict-free nets
+       untouched.
+
+    2. **Early stopping**: the congestion loop terminates as soon as the
+       conflict score reaches zero or fails to improve for
+       ``stagnation_limit`` consecutive iterations.
+
+    The outer loop structure (time-step management, magic-state gating,
+    dependency tracking) is identical to ``process_dag_with_pathfinder``
+    so that both algorithms are directly comparable in benchmarks.
+
+    Args:
+        processor: DAGProcessor instance.
+        dag: The DAGCircuit to process.
+        visualize_each_step: Whether to visualise each time step.
+
+    Returns:
+        list: Result dicts for every successfully routed node.  Each dict
+        contains the standard fields (``node``, ``gate_name``, ``qubits``,
+        ``time_step``, ``success``, ``magic_wait_cycles``,
+        ``magic_terminal``, ``qubit_terminals``, ``all_terminals``,
+        ``steiner_nodes``, ``steiner_edges``) plus HARVEST-only fields
+        ``"harvest_stats"`` and ``"algorithm": "harvest"``.
+    """
+    num_nodes = len(list(dag.op_nodes()))
+    logger.info(
+        f"Starting DAG processing with HARVEST - {num_nodes} operation nodes"
+    )
+
+    processed_nodes = set()
+    all_results = []
+    time_step = 0
+    idle_streak = 0
+    all_op_nodes = list(dag.op_nodes())
+    factory = processor.magic_source
+
+    while len(processed_nodes) < len(all_op_nodes):
+        logger.info(f"=== Time Step {time_step} ===")
+
+        if factory:
+            factory.tick()
+
+        processor.used_magic_terminals = set()
+
+        ready_nodes = get_ready_nodes(dag, all_op_nodes, processed_nodes)
+
+        if not ready_nodes:
+            logger.warning("No ready nodes found, breaking to avoid infinite loop")
+            break
+
+        ready_terminals = (
+            factory.get_ready_terminals()
+            if factory and not factory.unlimited
+            else None
+        )
+
+        executable_nodes = _filter_by_magic_availability(
+            ready_nodes, factory, ready_terminals
+        )
+
+        if not executable_nodes:
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            logger.info(
+                f"Time step {time_step}: idle (waiting for magic states, "
+                f"streak={idle_streak}, "
+                f"ready={factory.num_ready if factory else 'N/A'})"
+            )
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
+        idle_streak = 0
+
+        logger.info(
+            f"Found {len(executable_nodes)} executable nodes "
+            f"(of {len(ready_nodes)} ready): "
+            f"{[n.op.name for n in executable_nodes]}"
+        )
+
+        working_graph = processor.graph.copy()
+
+        time_step_results = _process_time_step_with_harvest(
+            processor, dag, executable_nodes, time_step, working_graph,
+            visualize_each_step, ready_terminals=ready_terminals,
+        )
+
+        successful_nodes = []
+        for result in time_step_results:
+            if result['success']:
+                processed_nodes.add(result['node'])
+                all_results.append(result)
+                successful_nodes.append(result['node'])
+                if factory and not factory.unlimited and node_needs_magic_state(result['node']):
+                    factory.consume(result['magic_terminal'])
+
+        successful_count = len(successful_nodes)
+        failed_count = len(time_step_results) - successful_count
+
+        logger.info(
+            f"Time step {time_step}: {successful_count} successful, "
+            f"{failed_count} failed"
+        )
+
+        if successful_count == 0:
+            logger.warning(
+                f"No progress in time step {time_step}, "
+                "remaining nodes cannot be routed"
+            )
+            break
+
+        time_step += 1
+
+        max_steps = num_nodes + _MAX_IDLE_CYCLES
+        if factory and not factory.unlimited:
+            prep = getattr(factory, 'preparation_cycles', 50)
+            max_steps += num_nodes * prep
+        if time_step > max_steps:
+            logger.error("Too many time steps - stopping")
+            break
+
+    logger.info(
+        f"Finished HARVEST processing in {time_step} time steps. "
+        f"Processed {len(all_results)}/{num_nodes} nodes successfully."
+    )
+    processor._scheduling_metadata = {
+        "total_elapsed_steps": time_step,
+        "num_nodes_completed": len(all_results),
+        "num_nodes_total": num_nodes,
+        "completed": len(processed_nodes) == len(all_op_nodes),
+    }
+    return all_results
+
+
+# ---------------------------------------------------------------------------
+# ILP-based Steiner forest packing scheduler
+# ---------------------------------------------------------------------------
+
+
+def _process_time_step_with_ilp(
+    processor,
+    dag,
+    ready_nodes,
+    time_step,
+    working_graph,
+    ilp_config,
+    ready_terminals=None,
+):
+    """Process one time step using the ILP Steiner forest router.
+
+    Falls back to the greedy packing algorithm when:
+      * The number of ready products exceeds ``ilp_config.max_ready_products``.
+      * The ILP solver raises an error.
+      * The ILP produces no scheduled products and ``fallback_to_greedy`` is
+        enabled.
+
+    Args:
+        processor: DAGProcessor instance.
+        dag: The DAGCircuit being scheduled.
+        ready_nodes: Executable nodes for this time step.
+        time_step: Current time-step index (for result dicts).
+        working_graph: Copy of the routing graph for this time step.
+        ilp_config: :class:`~harvest.routing.ilp_steiner_packing.ILPConfig`.
+        ready_terminals: Ready magic terminal IDs from the magic source,
+            or ``None`` for unlimited.
+
+    Returns:
+        List of result dicts compatible with the standard scheduler format.
+    """
+    if not ready_nodes:
+        return []
+
+    from .ilp_steiner_packing import ILPSteinerForestRouter
+    from .ilp_adapters import (
+        prepare_ilp_product_requests,
+        prune_magic_candidates,
+        routed_products_to_results,
+    )
+
+    # Build solver-facing product requests (no magic pre-selection).
+    product_requests, pid_to_node = prepare_ilp_product_requests(
+        processor, dag, ready_nodes, ready_terminals=ready_terminals
+    )
+
+    if not product_requests:
+        logger.warning(
+            "ILP: no valid product requests for time step %d — falling through.",
+            time_step,
+        )
+        return []
+
+    # Greedy fallback when product count exceeds ILP threshold.
+    if len(product_requests) > ilp_config.max_ready_products:
+        logger.info(
+            "ILP: %d products > max_ready_products=%d — greedy fallback.",
+            len(product_requests),
+            ilp_config.max_ready_products,
+        )
+        return _process_time_step_with_packing(
+            processor, dag, ready_nodes, time_step, working_graph,
+            False, ready_terminals=ready_terminals,
+        )
+
+    # Determine ready magic nodes (not yet used this step, reachable in graph).
+    ready_magic = [
+        m for m in processor.magic_terminals
+        if m not in processor.used_magic_terminals
+        and m in working_graph
+        and (ready_terminals is None or m in set(ready_terminals))
+    ]
+
+    if not ready_magic:
+        logger.warning("ILP: no ready magic terminals for time step %d.", time_step)
+        return []
+
+    # Distance-based magic candidate pruning.
+    candidate_roots = prune_magic_candidates(
+        product_requests,
+        ready_magic,
+        processor.pos,
+        ilp_config.max_magic_candidates,
+    )
+
+    # Invoke ILP solver.
+    try:
+        router = ILPSteinerForestRouter()
+        cycle_result = router.solve_cycle(
+            working_graph,
+            product_requests,
+            ready_magic,
+            candidate_roots=candidate_roots,
+            config=ilp_config,
+        )
+    except ImportError:
+        raise  # propagate so callers can warn the user
+    except Exception as exc:
+        logger.error("ILP solver error at time step %d: %s", time_step, exc)
+        if ilp_config.fallback_to_greedy:
+            logger.info("ILP: falling back to greedy due to solver error.")
+            return _process_time_step_with_packing(
+                processor, dag, ready_nodes, time_step, working_graph,
+                False, ready_terminals=ready_terminals,
+            )
+        return []
+
+    logger.info(
+        "ILP time step %d: status=%s scheduled=%d/%d solver_time=%.0fms",
+        time_step,
+        cycle_result.status,
+        len(cycle_result.scheduled),
+        len(product_requests),
+        cycle_result.solver_wall_time_ms,
+    )
+
+    # Greedy fallback when ILP scheduled nothing.
+    if not cycle_result.scheduled and ilp_config.fallback_to_greedy:
+        logger.info(
+            "ILP: no products scheduled (status=%s) — greedy fallback.",
+            cycle_result.status,
+        )
+        fallback_results = _process_time_step_with_packing(
+            processor, dag, ready_nodes, time_step, working_graph,
+            False, ready_terminals=ready_terminals,
+        )
+        for r in fallback_results:
+            r['ilp_fallback'] = True
+        return fallback_results
+
+    # Translate RoutedProduct objects to standard result dicts.
+    time_step_results = routed_products_to_results(
+        cycle_result.scheduled, pid_to_node, product_requests, time_step
+    )
+
+    # Update used_magic_terminals so the main loop can track consumption.
+    for result in time_step_results:
+        if result['success']:
+            processor.used_magic_terminals.add(result['magic_terminal'])
+
+    # Attach per-step ILP metadata to each result for analysis.
+    for result in time_step_results:
+        result['ilp_status'] = cycle_result.status
+        result['ilp_time_ms'] = cycle_result.solver_wall_time_ms
+        result['ilp_fallback'] = False
+
+    return time_step_results
+
+
+def process_dag_with_ilp_packing(processor, dag, ilp_config=None, visualize_each_step=False):
+    """Per-cycle ILP-based Steiner forest packing scheduler.
+
+    Operates the same scheduling loop as :func:`process_dag_with_packing`
+    but replaces the per-step greedy packing call with
+    :func:`_process_time_step_with_ilp`, which solves a mixed-integer
+    program to jointly select products and route node-disjoint Steiner trees.
+
+    Args:
+        processor: :class:`~harvest.routing.processor.DAGProcessor` instance.
+        dag: The DAGCircuit to schedule.
+        ilp_config: :class:`~harvest.routing.ilp_steiner_packing.ILPConfig`.
+            If ``None``, defaults to ``ILPConfig()``.
+        visualize_each_step: Unused; kept for API symmetry with other modes.
+
+    Returns:
+        list: Per-node result dicts (same format as all other schedulers).
+    """
+    from .ilp_steiner_packing import ILPConfig
+
+    if ilp_config is None:
+        ilp_config = ILPConfig()
+
+    num_nodes = len(list(dag.op_nodes()))
+    logger.info(
+        "Starting ILP Steiner packing — %d operation nodes, "
+        "time_limit=%dms, max_products=%d.",
+        num_nodes,
+        ilp_config.time_limit_ms,
+        ilp_config.max_ready_products,
+    )
+
+    processed_nodes = set()
+    all_results = []
+    time_step = 0
+    idle_streak = 0
+    all_op_nodes = list(dag.op_nodes())
+    factory = processor.magic_source
+
+    while len(processed_nodes) < len(all_op_nodes):
+        logger.debug("=== ILP Time Step %d ===", time_step)
+
+        if factory:
+            factory.tick()
+
+        processor.used_magic_terminals = set()
+
+        ready_nodes = get_ready_nodes(dag, all_op_nodes, processed_nodes)
+        if not ready_nodes:
+            logger.warning("ILP: no ready nodes — breaking.")
+            break
+
+        ready_terminals = (
+            factory.get_ready_terminals() if factory and not factory.unlimited else None
+        )
+        executable_nodes = _filter_by_magic_availability(ready_nodes, factory, ready_terminals)
+
+        if not executable_nodes:
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            logger.debug(
+                "ILP time step %d: idle (streak=%d, ready=%s)",
+                time_step,
+                idle_streak,
+                factory.num_ready if factory else "N/A",
+            )
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("ILP: maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
+        idle_streak = 0
+        logger.info(
+            "ILP time step %d: %d executable nodes.",
+            time_step,
+            len(executable_nodes),
+        )
+
+        working_graph = processor.graph.copy()
+        time_step_results = _process_time_step_with_ilp(
+            processor, dag, executable_nodes, time_step, working_graph,
+            ilp_config, ready_terminals=ready_terminals,
+        )
+
+        successful_nodes = []
+        for result in time_step_results:
+            if result['success']:
+                processed_nodes.add(result['node'])
+                all_results.append(result)
+                successful_nodes.append(result['node'])
+                if factory and not factory.unlimited and node_needs_magic_state(result['node']):
+                    factory.consume(result['magic_terminal'])
+
+        successful_count = len(successful_nodes)
+        logger.info("ILP time step %d: %d products scheduled.", time_step, successful_count)
+
+        if successful_count == 0:
+            logger.warning("ILP: no progress at time step %d — stopping.", time_step)
+            break
+
+        time_step += 1
+
+        max_steps = num_nodes + _MAX_IDLE_CYCLES
+        if factory and not factory.unlimited:
+            prep = getattr(factory, "preparation_cycles", 50)
+            max_steps += num_nodes * prep
+        if time_step > max_steps:
+            logger.error("ILP: too many time steps — stopping.")
+            break
+
+    logger.info(
+        "Finished ILP packing in %d time steps. Processed %d/%d nodes.",
+        time_step,
+        len(all_results),
+        num_nodes,
+    )
+    processor._scheduling_metadata = {
+        "total_elapsed_steps": time_step,
+        "num_nodes_completed": len(all_results),
+        "num_nodes_total": num_nodes,
+        "completed": len(processed_nodes) == len(all_op_nodes),
+    }
+    return all_results

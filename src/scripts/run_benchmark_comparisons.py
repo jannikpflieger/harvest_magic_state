@@ -78,9 +78,9 @@ NUM_FIXED_MAGIC = 8
 FIXED_MAGIC_SIDE = "top"
 SEED = 42
 
-MAX_QUBITS = 70
+MAX_QUBITS = 100
 MAX_DEPTH = 2000
-EXCLUDE_FAMILIES = {"qv", "qaoa"}
+EXCLUDE_FAMILIES = {"qv", "chemical"}
 
 SCHEDULERS = [
     ("Sequential", "steiner_tree"),
