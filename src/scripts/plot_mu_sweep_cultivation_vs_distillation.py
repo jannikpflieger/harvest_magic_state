@@ -96,51 +96,6 @@ def run_single(dag, layout_engine, source_label, magic_source):
         return {"source_label": source_label, "success": False, "error": str(exc)}
 
 
-# ── Plotting ───────────────────────────────────────────────────────────────
-
-def create_plot(mu_values, cultivation_steps, distillation_steps, output_base):
-    """Line plot: timesteps vs μ for cultivation; distillation as a horizontal reference."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    # Cultivation line
-    ax.plot(
-        mu_values, cultivation_steps,
-        marker="o", linewidth=2,
-        label="Cultivation",
-        color="#ff7f0e",
-    )
-
-    # Distillation reference line (single value at μ=15, drawn across the whole x range)
-    ax.axhline(
-        y=distillation_steps,
-        linewidth=2, linestyle="--", color="#1f77b4",
-        label="Distillation",
-    )
-    # Mark the exact distillation point at x=15
-    ax.plot(
-        DISTILLATION_CYCLES, distillation_steps,
-        marker="s", markersize=8, color="#1f77b4",
-    )
-
-    ax.set_xlabel("Preparation cycles", fontsize=13)
-    ax.set_ylabel("Timesteps", fontsize=13)
-    ax.set_xticks(mu_values)
-    ax.legend(fontsize=11)
-    ax.grid(alpha=0.3, linestyle="--")
-
-    plt.tight_layout()
-
-    png_path = output_base + ".png"
-    pdf_path = output_base + ".pdf"
-    plt.savefig(png_path, dpi=200, bbox_inches="tight")
-    plt.savefig(pdf_path, bbox_inches="tight")
-    plt.close()
-    logger.info(f"Saved PNG → {png_path}")
-    logger.info(f"Saved PDF → {pdf_path}")
-
-
-# ── Main ───────────────────────────────────────────────────────────────────
-
 def main():
     # ---- Load QAOA 100-qubit circuit ----
     qasm_path = os.path.join(
@@ -255,13 +210,6 @@ def main():
             default=str,
         )
     logger.info(f"Saved results → {json_path}")
-
-    # ---- Plot ----
-    if distillation_steps is not None:
-        plot_base = f"plots/{tag}"
-        create_plot(mu_values, cultivation_steps, distillation_steps, plot_base)
-    else:
-        logger.error("Skipping plot — distillation run failed.")
 
     # ---- Summary ----
     logger.info("\n" + "=" * 70)
