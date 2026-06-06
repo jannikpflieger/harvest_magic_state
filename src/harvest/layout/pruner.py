@@ -8,14 +8,6 @@ terminal set.  This module collects the set of *used* nodes from the result list
 and returns leaner versions of all four routing-graph structures:
 
     graph, ports_by_patch, pos, patch_used_by_port
-
-The :class:`LayoutEngine` itself (``eng.patches``, ``eng.occ``) is intentionally
-left unchanged — only the derived routing-graph view is pruned.
-
-Public API
-----------
-prune_lattice(results, graph, ports_by_patch, pos, patch_used_by_port)
-    → (pruned_graph, pruned_ports_by_patch, pruned_pos, pruned_patch_used_by_port, stats)
 """
 
 from __future__ import annotations
@@ -31,10 +23,6 @@ _PortsByPatch = Dict[str, Dict[str, List[str]]]
 _Pos = Dict[Any, Tuple[float, float]]
 _PatchUsedByPort = Dict[str, str]
 
-
-# ---------------------------------------------------------------------------
-# Public function
-# ---------------------------------------------------------------------------
 
 def prune_lattice(
     results: List[Dict],
@@ -90,9 +78,7 @@ def prune_lattice(
                 "data_patches_removed": int,
             }
     """
-    # ------------------------------------------------------------------
-    # 1. Collect the set of nodes that were actually used.
-    # ------------------------------------------------------------------
+
     used_nodes: Set = set()
     for r in results:
         # Routing cells and port nodes traversed by the Steiner tree
@@ -128,9 +114,7 @@ def prune_lattice(
     )
     logger.debug("Pruner: %d nodes were used during scheduling.", len(used_nodes))
 
-    # ------------------------------------------------------------------
-    # 2. Rebuild the graph, keeping only used nodes and their edges.
-    # ------------------------------------------------------------------
+
     pruned_graph: _Graph = {}
     for node, neighbours in graph.items():
         if node not in used_nodes:
@@ -139,9 +123,6 @@ def prune_lattice(
             (nbr, w) for (nbr, w) in neighbours if nbr in used_nodes
         ]
 
-    # ------------------------------------------------------------------
-    # 3. Filter the companion structures.
-    # ------------------------------------------------------------------
     pruned_pos: _Pos = {n: v for n, v in pos.items() if n in used_nodes}
 
     pruned_patch_used_by_port: _PatchUsedByPort = {
@@ -162,9 +143,6 @@ def prune_lattice(
         if new_type_map:
             pruned_ports_by_patch[patch_name] = new_type_map
 
-    # ------------------------------------------------------------------
-    # 4. Compute and log statistics.
-    # ------------------------------------------------------------------
     magic_patches_after_set = {
         patch_name for patch_name, type_map in pruned_ports_by_patch.items() if _is_magic_patch(type_map)
     }
@@ -172,7 +150,6 @@ def prune_lattice(
 
     nodes_after = len(pruned_graph)
     routing_after = sum(1 for n in pruned_graph if isinstance(n, tuple))
-    port_after = sum(1 for n in pruned_graph if isinstance(n, str))
     patches_after = len(pruned_ports_by_patch)
 
     removed_nodes = set(graph) - set(pruned_graph)

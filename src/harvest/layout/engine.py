@@ -758,10 +758,6 @@ class LayoutEngine:
 
         return results, remaining_graph
 
-    # ------------------------------------------------------------------
-    # HARVEST: Pathfinder-derived negotiated-congestion with selective
-    # rerouting and early stopping.
-    # ------------------------------------------------------------------
 
     def steiner_packing_harvest(
         self,
@@ -777,59 +773,6 @@ class LayoutEngine:
         greedy_order: str = "min_size",
         seed: int | None = None,
     ):
-        """HARVEST negotiated-congestion Steiner forest packer.
-
-        This is a Pathfinder-derived algorithm with two runtime-focused
-        improvements over ``steiner_packing_pathfinder``:
-
-        1. **Selective rerouting** — only nets whose current routing nodes
-           overlap with over-capacity nodes are ripped up and rerouted in
-           each iteration.  Conflict-free nets are left untouched, which
-           saves Steiner-tree calls proportional to the fraction of
-           uncontested nets.
-
-        2. **Early stopping** — the outer loop terminates as soon as the
-           conflict score (total excess capacity usage summed over all
-           routing nodes) reaches zero, *or* the score fails to improve
-           for ``stagnation_limit`` consecutive iterations.
-
-        Everything else — the node-cost model (``alpha`` × present usage +
-        ``beta`` × history), the history-penalty accumulator, the final
-        greedy-drop phase, and the remaining-graph commit — is identical to
-        ``steiner_packing_pathfinder`` so that both algorithms are
-        directly comparable in benchmarks.
-
-        Args:
-            graph: adjacency list {node: [(nbr, w), ...]}.
-            terminal_sets: list[list[node]] — one entry per net.
-            max_iters: upper bound on negotiated-congestion iterations.
-            alpha: weight for the present-congestion penalty.
-            beta: weight for the history penalty.
-            capacity: routing-node capacity (1 = node-disjoint routing cells).
-            stagnation_limit: stop early when the conflict score does not
-                improve for this many consecutive iterations.
-            prune_cycles: forwarded to ``steiner_tree``.
-            greedy_order: "min_size", "max_size", or "original".
-            seed: optional RNG seed (affects drop-phase tie-breaking only).
-
-        Returns:
-            results: list[dict] at the same positions as *terminal_sets*.
-                Each dict has the same keys as ``steiner_packing_pathfinder``
-                results plus an additional ``"harvest_stats"`` key.
-            remaining_graph: graph with committed routing nodes removed.
-            stats: lightweight dict summarising the HARVEST run::
-
-                {
-                    "iterations":           int,   # congestion iterations run
-                    "initial_routes":       int,   # nets routed in initial pass
-                    "reroutes":             int,   # total rip-up+reroute calls
-                    "conflicted_reroutes":  int,   # subset that were conflicted
-                    "dropped":              int,   # nets dropped in final phase
-                    "final_conflict_score": int,   # 0 means fully resolved
-                    "stopped_reason":       str,   # "no_conflicts" | "stagnation"
-                                                   #   | "max_iters"
-                }
-        """
         if seed is not None:
             random.seed(seed)
 
@@ -871,8 +814,6 @@ class LayoutEngine:
                 indexed.sort(key=lambda x: len(x[1]), reverse=True)
             return indexed
 
-        # --- State -----------------------------------------------------------
-
         base_graph = _copy_graph(graph)
         indexed_sets = _order_indices(terminal_sets)
 
@@ -880,15 +821,12 @@ class LayoutEngine:
         usage = Counter()
         history = defaultdict(float)
 
-        # --- Stats -----------------------------------------------------------
 
         stats_initial_routes = 0
         stats_reroutes = 0
         stats_conflicted_reroutes = 0
         stats_iterations = 0
         stopped_reason = "max_iters"
-
-        # --- Initial routing (no penalties) ----------------------------------
 
         node_cost = {}
         weighted_graph = _build_weighted_graph(base_graph, node_cost)
@@ -915,8 +853,6 @@ class LayoutEngine:
                     "success": False,
                     "error": str(e),
                 }
-
-        # --- HARVEST: selective reroute + early stopping ---------------------
 
         best_conflict_score = None
         stagnation_count = 0
@@ -1107,9 +1043,6 @@ class LayoutEngine:
         return results, remaining_graph, stats
 
 
-# -------------------------
-# Patch constructors
-# -------------------------
 
 def _swap_type(t: str, swap_xz: bool) -> str:
     if not swap_xz:

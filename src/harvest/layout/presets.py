@@ -1,24 +1,7 @@
-# preset_layout_7x9_magic_ring.py
-"""
-Preset: 7x9 grid with
-  - magic state patches on the boundary (skipping corners), ports facing inward
-  - 4 vertical 2-tile / 2-qubit "paired patches" in the interior (alternating X/Z ports around perimeter)
-    labeled as (0,1), (2,3), (4,5), (6,7)
-
-This uses the layout engine + constructors from `lattice_double_patches.py`.
-
-Typical usage:
---------------
-from preset_layout_7x9_magic_ring import build_7x9_magic_ring_layout
-
-eng = build_7x9_magic_ring_layout()
-eng.visualize_layout("7x9 magic-ring + 4 paired 2Q patches")
-"""
-
 from __future__ import annotations
 from typing import Tuple
 
-from harvest.layout.engine import LayoutEngine, magic_patch_1cell, paired_patches_2q_alternating, data_patch_1cell
+from harvest.layout.engine import LayoutEngine, magic_patch_1cell, data_patch_1cell
 
 Coord = Tuple[int, int]
 
@@ -193,29 +176,19 @@ def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_
                 eng.add_patch(p)
             qubit_idx += 4
 
-    # --- Place magic state patches around the perimeter ---
-    # Top edge (y=0): face inward => port on 'S'
     for x in range(1, W - 1):
         eng.add_patch(magic_patch_1cell(f"mT{x}", (x, 0), side="S"))
     
-    # Bottom edge (y=H-1): face inward => port on 'N'
     for x in range(1, W - 1):
         eng.add_patch(magic_patch_1cell(f"mB{x}", (x, H - 1), side="N"))
     
-    # Left edge (x=0): face inward => port on 'E'
     for y in range(1, H - 1):
         eng.add_patch(magic_patch_1cell(f"mL{y}", (0, y), side="E"))
     
-    # Right edge (x=W-1): face inward => port on 'W'
     for y in range(1, H - 1):
         eng.add_patch(magic_patch_1cell(f"mR{y}", (W - 1, y), side="W"))
     
     return eng
-
-
-# ---------------------------------------------------------------------------
-# Helpers for one-side / fixed-count magic placement
-# ---------------------------------------------------------------------------
 
 _SIDE_CONFIG = {
     "top":    lambda W, H: ([(x, 0)     for x in range(1, W - 1)], "S", "mT"),
@@ -260,10 +233,6 @@ def _add_magic_fixed_count(eng, W, H, num_magic, side="top"):
         idx = coord[0] if side in ("top", "bottom") else coord[1]
         eng.add_patch(magic_patch_1cell(f"{prefix}{idx}", coord, side=port_side))
 
-
-# ---------------------------------------------------------------------------
-# One-side magic layouts
-# ---------------------------------------------------------------------------
 
 def nxm_one_side_magic_layout_single_qubits(
     n: int, m: int, *, side: str = "top", swap_xz: bool = False,
@@ -320,10 +289,6 @@ def nxm_one_side_magic_layout_single_qubits_large_spacing(
     return eng
 
 
-# ---------------------------------------------------------------------------
-# Fixed-count magic layouts
-# ---------------------------------------------------------------------------
-
 def nxm_fixed_magic_count_layout_single_qubits(
     n: int, m: int, num_magic: int, *, side: str = "top", swap_xz: bool = False,
 ) -> LayoutEngine:
@@ -362,11 +327,7 @@ def nxm_fixed_magic_count_layout_single_qubits(
 def nxm_fixed_magic_count_layout_single_qubits_large_spacing(
     n: int, m: int, num_magic: int, *, side: str = "top", swap_xz: bool = False,
 ) -> LayoutEngine:
-    """
-    Same grid as ``nxm_ring_layout_single_qubits_large_spacing`` (double
-    spacing, W=3n+2, H=3m+2) but with exactly *num_magic* magic patches
-    evenly distributed along one side.
-    """
+
     W = 3 * n + 2
     H = 3 * m + 2
     eng = LayoutEngine(W, H)
@@ -381,11 +342,3 @@ def nxm_fixed_magic_count_layout_single_qubits_large_spacing(
 
     _add_magic_fixed_count(eng, W, H, num_magic, side=side)
     return eng
-
-
-if __name__ == "__main__":
-
-    eng = blocks_of_four_qubit_patches(2, 2)
-    eng.visualize_layout("2x2 blocks of 4 qubits with magic ring (9x9 grid)")
-    graph, ports_by_patch, pos, patch_used_by_port = eng.build_routing_graph()
-    eng.visualize_graph(graph, pos, "Routing graph overlay for 2x2 blocks of 4 qubits")
