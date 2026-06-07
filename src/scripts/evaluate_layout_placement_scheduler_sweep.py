@@ -105,7 +105,8 @@ ALL_SCHEDULERS: List[Tuple[str, str]] = [
 DEFAULT_SCHEDULERS = ["steiner_pathfinder", "steiner_tree"]
 
 PLACEMENTS   = ["row_major", "circuit_aware"]
-LAYOUT_TYPES = ["single_spacing", "double_spacing", "blocks_of_four"]
+#LAYOUT_TYPES = ["single_spacing", "double_spacing", "blocks_of_four"]
+LAYOUT_TYPES = ["single_spacing"]
 
 DEFAULT_EXCLUDE_FAMILIES    = ["qv", "chemical"]
 DEFAULT_MAX_QUBITS          = 100

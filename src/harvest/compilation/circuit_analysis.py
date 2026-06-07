@@ -17,10 +17,7 @@ from qiskit.transpiler.passes import RemoveFinalMeasurements, RemoveBarriers
 from qiskit.circuit.equivalence_library import SessionEquivalenceLibrary as sel
 from qiskit import QuantumCircuit
 
-from bqskit.ft import CliffordTModel
-from bqskit import compile
 from bqskit.ir.circuit import Circuit
-from bqskit.ext import qiskit_to_bqskit, bqskit_to_qiskit
 
 
 def is_identity_op(op) -> bool:

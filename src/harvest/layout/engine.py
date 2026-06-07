@@ -19,10 +19,6 @@ Coord = Tuple[int, int]
 Node = Union[Coord, str]
 
 
-# -------------------------
-# Data structures
-# -------------------------
-
 @dataclass(frozen=True)
 class EdgePort:
     patch: str
@@ -36,14 +32,12 @@ class EdgePort:
         # parseable: last field is the type
         return f"P:{self.patch}:{self.port_id}:{self.port_type}"
 
-
 @dataclass
 class Patch:
     name: str
     kind: str
     cells: Set[Coord]
     ports: List[EdgePort] = field(default_factory=list)
-
 
 class LayoutEngine:
     def __init__(self, width: int, height: int):
@@ -192,9 +186,6 @@ class LayoutEngine:
         return new_graph, ports_by_patch, pos, patch_used_by_port
     
 
-    # -------------------------
-    # Steiner / terminal routing helpers
-    # -------------------------
 
     def _dijkstra(self, graph, source, targets=None):
         """
@@ -758,7 +749,6 @@ class LayoutEngine:
 
         return results, remaining_graph
 
-
     def steiner_packing_harvest(
         self,
         graph,
@@ -1041,7 +1031,6 @@ class LayoutEngine:
         }
 
         return results, remaining_graph, stats
-
 
 
 def _swap_type(t: str, swap_xz: bool) -> str:

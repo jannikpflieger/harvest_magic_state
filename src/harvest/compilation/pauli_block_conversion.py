@@ -1,7 +1,7 @@
 from qiskit import QuantumCircuit
 import numpy as np
 from qiskit.converters import circuit_to_dag
-from qiskit.transpiler.passes import RemoveFinalMeasurements, LitinskiTransformation
+from qiskit.transpiler.passes import LitinskiTransformation
 from qiskit.transpiler import PassManager
 import random
 
