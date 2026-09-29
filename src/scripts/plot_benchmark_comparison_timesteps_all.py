@@ -12,13 +12,15 @@ Outputs:
 
 import csv
 import json
+import argparse
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-EXCLUDED_FAMILIES = {"qv", "chemical"}
+EXCLUDED_FAMILIES = {"qv", "chemical", "dtc"}
 MAX_QUBITS = 100
 
 
@@ -64,9 +66,13 @@ def extract_timesteps_from_result_file(file_path):
     return sequential_ts, greedy_ts
 
 
-def discover_benchmark_circuit_results(base_path):
+def discover_benchmark_circuit_results(base_path, results_dir=None):
     """Return benchmark comparison result files that match the requested filters."""
-    results_dir = base_path / "routing_experiment_results" / "benchmark_comparison"
+    results_dir = (
+        Path(results_dir)
+        if results_dir is not None
+        else base_path / "routing_experiment_results" / "benchmark_comparison"
+    )
     if not results_dir.exists():
         raise FileNotFoundError(f"Missing results directory: {results_dir}")
 
@@ -91,21 +97,31 @@ def discover_benchmark_circuit_results(base_path):
     return selected
 
 
-def load_all_circuit_data(base_path):
+def load_all_circuit_data(base_path, results_dir=None, require_sequential=True,
+                          sequential_baseline_results_dir=None):
     """Load sequential vs greedy timestep data for all eligible benchmark circuits."""
     rows = []
+    if sequential_baseline_results_dir is not None:
+        print(
+            "Note: --sequential-baseline-results-dir is ignored; "
+            "sequential_timesteps uses circuit_metadata.t_count."
+        )
 
-    for result_file, metadata in discover_benchmark_circuit_results(base_path):
-        sequential_ts, greedy_ts = extract_timesteps_from_result_file(str(result_file))
+    for result_file, metadata in discover_benchmark_circuit_results(base_path, results_dir):
+        _, greedy_ts = extract_timesteps_from_result_file(
+            str(result_file)
+        )
+        sequential_ts = metadata.get("t_count")
 
-        if sequential_ts is None or greedy_ts is None:
-            print(f"Skipping {result_file.name}: could not find both timestep values")
+        if greedy_ts is None or (require_sequential and sequential_ts is None):
+            needed = "both timestep values" if require_sequential else "greedy timestep value"
+            print(f"Skipping {result_file.name}: could not find {needed}")
             continue
 
         circuit_name = metadata.get("circuit_name", result_file.stem)
         family = metadata.get("family", "")
         num_qubits = metadata.get("num_qubits")
-        speedup = sequential_ts / greedy_ts if greedy_ts else None
+        speedup = sequential_ts / greedy_ts if sequential_ts is not None and greedy_ts else None
 
         rows.append(
             {
@@ -220,33 +236,72 @@ def create_comparison_plot(rows, output_path_png, output_path_pdf=None):
 
 def main():
     """Main execution function."""
+    parser = argparse.ArgumentParser(
+        description="Summarize benchmark comparison timesteps.",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Only write the CSV summary.",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="Directory containing per-circuit benchmark comparison JSON files.",
+    )
+    parser.add_argument(
+        "--allow-missing-sequential",
+        action="store_true",
+        help="Keep rows that have greedy timesteps but no circuit_metadata.t_count.",
+    )
+    parser.add_argument(
+        "--sequential-baseline-results-dir",
+        default=None,
+        help=(
+            "Deprecated; sequential timesteps are read from circuit_metadata.t_count."
+        ),
+    )
+    args = parser.parse_args()
+
     script_dir = Path(__file__).parent
     base_path = script_dir.parent.parent
 
     print("Loading benchmark circuit data...")
-    rows = load_all_circuit_data(base_path)
+    rows = load_all_circuit_data(
+        base_path,
+        results_dir=args.results_dir,
+        require_sequential=not args.allow_missing_sequential,
+        sequential_baseline_results_dir=args.sequential_baseline_results_dir,
+    )
 
     print(f"\nLoaded {len(rows)} benchmark circuits after filtering")
     print("Extracted data:")
     for row in rows:
+        speedup_text = (
+            f"{row['speedup']:.1f}x"
+            if row["speedup"] is not None
+            else "n/a"
+        )
         print(
             f"  {row['circuit_name']} ({row['num_qubits']}q): "
             f"sequential={row['sequential_timesteps']}, "
             f"greedy={row['greedy_timesteps']}, "
-            f"speedup={row['speedup']:.1f}x"
+            f"speedup={speedup_text}"
         )
 
     output_dir = base_path / "plots"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path_png = output_dir / "benchmark_comparison_timesteps_all.png"
     output_path_pdf = output_dir / "benchmark_comparison_timesteps_all.pdf"
-    output_path_csv = output_dir / "benchmark_comparison_timesteps_all.csv"
+    output_path_csv = output_dir / f"benchmark_comparison_timesteps_all_{ts}.csv"
 
     save_comparison_csv(rows, str(output_path_csv))
 
-    print("\nGenerating plot...")
-    create_comparison_plot(rows, str(output_path_png), str(output_path_pdf))
+    if not args.no_plots:
+        print("\nGenerating plot...")
+        create_comparison_plot(rows, str(output_path_png), str(output_path_pdf))
     print("Done!")
 
 

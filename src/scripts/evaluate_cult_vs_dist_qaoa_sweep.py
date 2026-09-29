@@ -267,6 +267,22 @@ def main():
         help="Only process circuits whose filename contains this substring (e.g. 'ising').",
     )
     parser.add_argument(
+        "--exclude-families",
+        nargs="+",
+        default=None,
+        metavar="FAMILY",
+        help="Exclude circuits whose path contains any of these family directory names "
+             "(e.g. 'random_circuits' 'qv' 'square-heisenberg' 'feynman').",
+    )
+    parser.add_argument(
+        "--family-filter",
+        nargs="+",
+        default=None,
+        metavar="FAMILY",
+        help="Only include circuits whose path contains at least one of these family names "
+             "(e.g. 'ising' 'qaoa' 'qft'). Takes precedence over --exclude-families.",
+    )
+    parser.add_argument(
         "--num-magic-min",
         type=int,
         default=None,
@@ -279,6 +295,13 @@ def main():
         help="Override the upper bound of NUM_MAGIC_RANGE (inclusive).",
     )
     parser.add_argument(
+        "--num-magic-values",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit list of num_magic values to sweep (overrides --num-magic-min/max).",
+    )
+    parser.add_argument(
         "--mu-min",
         type=int,
         default=None,
@@ -289,6 +312,13 @@ def main():
         type=int,
         default=None,
         help="Override the upper bound of MU_RANGE (inclusive).",
+    )
+    parser.add_argument(
+        "--mu-values",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit list of mu values to sweep (overrides --mu-min/--mu-max).",
     )
     parser.add_argument(
         "--use-all-magic",
@@ -319,7 +349,9 @@ def main():
     )
 
     # Allow CLI to override num_magic range (ascending when custom bounds are given)
-    if args.num_magic_min is not None or args.num_magic_max is not None:
+    if args.num_magic_values is not None:
+        num_magic_range = sorted(args.num_magic_values)
+    elif args.num_magic_min is not None or args.num_magic_max is not None:
         nm_min = args.num_magic_min if args.num_magic_min is not None else NUM_MAGIC_RANGE[-1]
         nm_max = args.num_magic_max if args.num_magic_max is not None else NUM_MAGIC_RANGE[0]
         num_magic_range = range(nm_min, nm_max + 1)
@@ -327,7 +359,9 @@ def main():
         num_magic_range = NUM_MAGIC_RANGE
 
     # Allow CLI to override mu range
-    if args.mu_min is not None or args.mu_max is not None:
+    if args.mu_values is not None:
+        mu_range = sorted(args.mu_values)
+    elif args.mu_min is not None or args.mu_max is not None:
         mu_min = args.mu_min if args.mu_min is not None else MU_RANGE.start
         mu_max = args.mu_max if args.mu_max is not None else MU_RANGE.stop - 1
         mu_range = range(mu_min, mu_max + 1)
@@ -347,8 +381,15 @@ def main():
     all_qasm = find_qasm_files(str(qasm_dir))
     if args.name_filter:
         all_qasm = [p for p in all_qasm if args.name_filter in Path(p).name]
+    if args.family_filter:
+        include = args.family_filter
+        all_qasm = [p for p in all_qasm if any(fam in str(Path(p)) for fam in include)]
+    elif args.exclude_families:
+        exclude = args.exclude_families
+        all_qasm = [p for p in all_qasm if not any(fam in Path(p).parts for fam in exclude)]
     logger.info(f"Found {len(all_qasm)} QASM files under {qasm_dir}"
-                + (f" (filtered by '{args.name_filter}')" if args.name_filter else ""))
+                + (f" (filtered by '{args.name_filter}')" if args.name_filter else "")
+                + (f" (excluded families: {args.exclude_families})" if args.exclude_families else ""))
 
     accepted: List[Tuple[str, object, object]] = []
     for qasm_path in all_qasm:
@@ -376,8 +417,8 @@ def main():
 
     logger.info(f"\n{'='*70}")
     logger.info(f"Processing {len(accepted)} circuits.")
-    logger.info(f"  mu range       : {mu_range.start} … {mu_range.stop - 1}")
-    logger.info(f"  num_magic range: {'all available' if args.use_all_magic else '1 … layout max (per circuit)' if args.num_magic_to_layout_max else f'{list(num_magic_range)[0]} … {list(num_magic_range)[-1]}'}")
+    logger.info(f"  mu range       : {list(mu_range)}")
+    logger.info(f"  num_magic range: {'all available' if args.use_all_magic else '1 … layout max (per circuit)' if args.num_magic_to_layout_max else str(list(num_magic_range))}")
     logger.info(f"  qubit filter   : {min_qubits} … {max_qubits}")
     logger.info(f"  name filter    : {args.name_filter or '(none)'}")
     logger.info(f"  layout preset  : {args.layout_preset}")

@@ -20,17 +20,21 @@ Usage:
     python scripts/run_benchmark_comparisons.py
     python scripts/run_benchmark_comparisons.py --force          # re-run existing
     python scripts/run_benchmark_comparisons.py --max-qubits 30  # smaller subset
+    python scripts/run_benchmark_comparisons.py --timestamp-output-dir
 """
 
 import argparse
 import copy
 import json
 import logging
+import math
 import os
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional
+import re
 
 import matplotlib
 matplotlib.use("Agg")
@@ -50,6 +54,7 @@ from harvest.compilation.circuit_analysis import convert_rx_ry_to_rz, pre_prep_c
 from harvest.routing.processor import DAGProcessor
 from harvest.routing.magic_state_factory import MagicStateFactory
 from harvest.routing.magic_state_cultivator import MagicStateCultivator, geometric_sampler
+from harvest.layout.presets import nxm_ring_layout_single_qubits
 from harvest.synthesis.synthesizer import StaticLayoutSynthesizer
 from harvest.synthesis.placement import PlacementConfig, circuit_aware_placement
 from harvest.synthesis.emitter import emit_layout
@@ -254,8 +259,71 @@ def make_source(label, magic_terminals):
 # Single experiment run
 # ---------------------------------------------------------------------------
 
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+
+
+def _auto_grid(num_qubits: int) -> tuple[int, int]:
+    cols = max(1, math.ceil(math.sqrt(num_qubits)))
+    rows = max(1, math.ceil(num_qubits / cols))
+    return cols, rows
+
+
+def _timestamped_dir(base_dir: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return base_dir.with_name(f"{base_dir.name}_{ts}")
+
+
+def _qubit_idx_from_terminal(port: str) -> Optional[int]:
+    parts = port.split(":")
+    if len(parts) >= 2 and parts[1].startswith("q_"):
+        try:
+            return int(parts[1][2:])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_schedule_plan(results: List[Dict]) -> Dict:
+    timestep_map: Dict[int, List[Dict]] = {}
+    for r in results:
+        if not r.get("success", True):
+            continue
+        step = int(r.get("time_step", 0))
+        steiner_nodes = r.get("steiner_nodes", set())
+        routing_cells = sorted([list(n) for n in steiner_nodes if isinstance(n, tuple)])
+        port_nodes = sorted([n for n in steiner_nodes if isinstance(n, str)])
+        qubit_terminals = r.get("qubit_terminals", [])
+        qubit_indices = sorted(set(
+            idx
+            for t in qubit_terminals
+            for idx in [_qubit_idx_from_terminal(t)]
+            if idx is not None
+        ))
+        route = {
+            "gate_name": r.get("gate_name", ""),
+            "qubit_indices": qubit_indices,
+            "magic_terminal": r.get("magic_terminal"),
+            "qubit_ports": qubit_terminals,
+            "routing_cells": routing_cells,
+            "port_nodes": port_nodes,
+        }
+        timestep_map.setdefault(step, []).append(route)
+
+    timesteps = [
+        {"step": step, "routes": routes}
+        for step, routes in sorted(timestep_map.items())
+    ]
+    return {
+        "num_timesteps": len(timesteps),
+        "routes_total": sum(len(ts["routes"]) for ts in timesteps),
+        "timesteps": timesteps,
+    }
+
+
 def run_single(dag, layout_engine, scheduler_mode, scheduler_label,
-               source_label, magic_source=None, topology_label=None):
+               source_label, magic_source=None, topology_label=None,
+               include_schedule=False):
     """Route *dag* on *layout_engine* and return a metrics dict."""
     tag = f"{topology_label} | " if topology_label else ""
     logger.info("    %s%s + %s", tag, scheduler_label, source_label)
@@ -301,6 +369,9 @@ def run_single(dag, layout_engine, scheduler_mode, scheduler_label,
         else:
             result["magic_wait_cycles"] = 0
 
+        if include_schedule:
+            result["_schedule_plan"] = _build_schedule_plan(results)
+
         return result
     except Exception as e:
         logger.error("    FAILED: %s", e)
@@ -321,13 +392,17 @@ def run_single(dag, layout_engine, scheduler_mode, scheduler_label,
 # Per-circuit pipeline
 # ---------------------------------------------------------------------------
 
-def process_circuit(record):
+def process_circuit(record, schedulers=None, source_labels=None,
+                    layout_preset="circuit_aware",
+                    run_magic_access=True, schedules_dir=None):
     """Run all comparisons for a single circuit.
 
     Returns the full result dict to be written as JSON, or None on failure.
     """
     circuit_name = record["circuit_name"]
     qasm_path = record["qasm_path"]
+    schedulers = schedulers or SCHEDULERS
+    source_labels = source_labels or SOURCE_LABELS
 
     logger.info("Loading circuit '%s' from %s", circuit_name, qasm_path)
     circuit = qasm_to_circuit(qasm_path)
@@ -340,23 +415,41 @@ def process_circuit(record):
     pcb = convert_to_PCB(circuit, verbose=False)
     dag = create_dag(pcb)
 
-    # ── Synthesize circuit-aware layout ──
-    synth = StaticLayoutSynthesizer(
-        placement_config=PlacementConfig(
-            alpha=1.0, beta=0.5, max_swap_iterations=100, seed=SEED,
-        ),
-    )
-    engine, report = synth.synthesize(dag)
-    logger.info("  Layout: %s (%dx%d), cost %.2f",
-                report.template_name, report.grid_width, report.grid_height,
-                report.placement_cost)
+    if layout_preset == "single_spacing":
+        cols, rows = _auto_grid(record["num_qubits"])
+        engine = nxm_ring_layout_single_qubits(cols, rows)
+        layout_info = {
+            "template_name": "single_spacing",
+            "layout_preset": layout_preset,
+            "data_grid_cols": cols,
+            "data_grid_rows": rows,
+            "grid_width": engine.W,
+            "grid_height": engine.H,
+            "placement_cost": 0.0,
+        }
+        logger.info(
+            "  Layout: single_spacing data grid %dx%d (%dx%d)",
+            cols, rows, engine.W, engine.H,
+        )
+    else:
+        # ── Synthesize circuit-aware layout ──
+        synth = StaticLayoutSynthesizer(
+            placement_config=PlacementConfig(
+                alpha=1.0, beta=0.5, max_swap_iterations=100, seed=SEED,
+            ),
+        )
+        engine, report = synth.synthesize(dag)
+        logger.info("  Layout: %s (%dx%d), cost %.2f",
+                    report.template_name, report.grid_width, report.grid_height,
+                    report.placement_cost)
 
-    layout_info = {
-        "template_name": report.template_name,
-        "grid_width": report.grid_width,
-        "grid_height": report.grid_height,
-        "placement_cost": report.placement_cost,
-    }
+        layout_info = {
+            "template_name": report.template_name,
+            "layout_preset": layout_preset,
+            "grid_width": report.grid_width,
+            "grid_height": report.grid_height,
+            "placement_cost": report.placement_cost,
+        }
 
     # Discover magic terminals from the default engine
     temp_proc = DAGProcessor(layout_engine=engine)
@@ -367,46 +460,66 @@ def process_circuit(record):
     # ──────────────────────────────────────────────────────────────────
     logger.info("  Running Factory vs Cultivation (9 experiments) ...")
     fvc_results = []
-    for sched_label, sched_mode in SCHEDULERS:
-        for src_label in SOURCE_LABELS:
+    for sched_label, sched_mode in schedulers:
+        for src_label in source_labels:
             source = make_source(src_label, magic_terminals)
             result = run_single(dag, engine, sched_mode, sched_label,
-                                src_label, magic_source=source)
+                                src_label, magic_source=source,
+                                include_schedule=schedules_dir is not None)
+            schedule = result.pop("_schedule_plan", None)
+            if schedule is not None:
+                schedule.update({
+                    "circuit_name": circuit_name,
+                    "experiment": "factory_vs_cultivation",
+                    "scheduler_label": sched_label,
+                    "scheduler_mode": sched_mode,
+                    "source_label": src_label,
+                })
+                schedule_name = (
+                    f"{_safe_name(circuit_name)}_fvc_{_safe_name(sched_mode)}_"
+                    f"{_safe_name(src_label)}"
+                    ".json"
+                )
+                (schedules_dir / schedule_name).write_text(
+                    json.dumps(schedule, indent=2, default=str)
+                )
             fvc_results.append(result)
 
     # ──────────────────────────────────────────────────────────────────
     # 2. Magic Access Topology comparison (27 experiments)
     # ──────────────────────────────────────────────────────────────────
-    logger.info("  Running Magic Access Topology comparison (27 experiments) ...")
-
-    # Re-obtain template and placement for topology variants
-    summary = extract_circuit_summary(dag)
-    template = select_template(
-        n_qubits=summary.num_qubits,
-        max_parallelism=summary.parallelism_profile.get("max_pauli_per_layer", 0),
-    )
-    placement = circuit_aware_placement(
-        summary, template,
-        PlacementConfig(alpha=1.0, beta=0.5, max_swap_iterations=100, seed=SEED),
-    )
-
-    engines = build_topology_engines(template, placement)
-    topology_info = {}
-    for topo_label, eng in engines.items():
-        tp = DAGProcessor(layout_engine=eng)
-        topology_info[topo_label] = len(tp.magic_terminals)
-
     ma_results = []
-    for topo_label, eng in engines.items():
-        tp = DAGProcessor(layout_engine=eng)
-        topo_magic_terminals = tp.magic_terminals
-        for sched_label, sched_mode in SCHEDULERS:
-            for src_label in SOURCE_LABELS:
-                source = make_source(src_label, topo_magic_terminals)
-                result = run_single(dag, eng, sched_mode, sched_label,
-                                    src_label, magic_source=source,
-                                    topology_label=topo_label)
-                ma_results.append(result)
+    topology_info = {}
+    if run_magic_access:
+        logger.info("  Running Magic Access Topology comparison (27 experiments) ...")
+
+        # Re-obtain template and placement for topology variants
+        summary = extract_circuit_summary(dag)
+        template = select_template(
+            n_qubits=summary.num_qubits,
+            max_parallelism=summary.parallelism_profile.get("max_pauli_per_layer", 0),
+        )
+        placement = circuit_aware_placement(
+            summary, template,
+            PlacementConfig(alpha=1.0, beta=0.5, max_swap_iterations=100, seed=SEED),
+        )
+
+        engines = build_topology_engines(template, placement)
+        for topo_label, eng in engines.items():
+            tp = DAGProcessor(layout_engine=eng)
+            topology_info[topo_label] = len(tp.magic_terminals)
+
+        for topo_label, eng in engines.items():
+            tp = DAGProcessor(layout_engine=eng)
+            topo_magic_terminals = tp.magic_terminals
+            for sched_label, sched_mode in schedulers:
+                for src_label in source_labels:
+                    source = make_source(src_label, topo_magic_terminals)
+                    result = run_single(dag, eng, sched_mode, sched_label,
+                                        src_label, magic_source=source,
+                                        topology_label=topo_label,
+                                        include_schedule=False)
+                    ma_results.append(result)
 
     # ── Build output ──
     circuit_metadata = {
@@ -685,6 +798,39 @@ def main():
         help="Circuit families to exclude (default: qv).",
     )
     parser.add_argument(
+        "--schedulers", type=str, nargs="+",
+        choices=[mode for _, mode in SCHEDULERS],
+        default=[mode for _, mode in SCHEDULERS],
+        help="Scheduler modes to run.",
+    )
+    parser.add_argument(
+        "--sources", type=str, nargs="+",
+        choices=["Unlimited", "Factory", "Cultivation"],
+        default=["Unlimited", "Factory", "Cultivation"],
+        help="Magic-state source groups to run.",
+    )
+    parser.add_argument(
+        "--layout-preset", choices=["circuit_aware", "single_spacing"],
+        default="circuit_aware",
+        help="Layout to use for factory-vs-cultivation runs.",
+    )
+    parser.add_argument(
+        "--skip-magic-access", action="store_true",
+        help="Only run factory-vs-cultivation style results.",
+    )
+    parser.add_argument(
+        "--skip-plots", action="store_true",
+        help="Do not generate per-circuit plots.",
+    )
+    parser.add_argument(
+        "--save-schedules", action="store_true",
+        help="Save per-run schedule JSONs under OUTPUT_DIR/schedules.",
+    )
+    parser.add_argument(
+        "--max-circuits", type=int, default=0,
+        help="Process at most this many eligible circuits. 0 means all.",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Re-run circuits that already have output JSON.",
     )
@@ -692,19 +838,43 @@ def main():
         "--output-dir", type=str, default=str(OUTPUT_DIR),
         help="Directory for per-circuit result JSONs.",
     )
+    parser.add_argument(
+        "--timestamp-output-dir", action="store_true",
+        help="Append YYYYMMDD_HHMMSS to --output-dir to avoid overwriting runs.",
+    )
     args = parser.parse_args()
 
     max_q = args.max_qubits if args.max_qubits > 0 else None
     max_d = args.max_depth if args.max_depth > 0 else None
     excl = set(args.exclude_families) if args.exclude_families else None
     out_dir = Path(args.output_dir)
+    if args.timestamp_output_dir:
+        out_dir = _timestamped_dir(out_dir)
+        logger.info("Timestamped output directory: %s", out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir = out_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    if not args.skip_plots:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+    schedules_dir = out_dir / "schedules" if args.save_schedules else None
+    if schedules_dir is not None:
+        schedules_dir.mkdir(parents=True, exist_ok=True)
+
+    scheduler_label_for = {mode: label for label, mode in SCHEDULERS}
+    selected_schedulers = [
+        (scheduler_label_for[mode], mode)
+        for mode in args.schedulers
+    ]
+    selected_sources = [
+        label
+        for label in SOURCE_LABELS
+        if any(label.startswith(source) for source in args.sources)
+    ]
 
     # ── Phase 1: Discover circuits ──
     records = load_eligible_circuits(args.analysis_dir, max_qubits=max_q,
                                      max_depth=max_d, exclude_families=excl)
+    if args.max_circuits and args.max_circuits > 0:
+        records = records[:args.max_circuits]
     if not records:
         logger.error("No eligible circuits found. Exiting.")
         return
@@ -718,8 +888,8 @@ def main():
         fvc_plot = plot_dir / f"{cname}_fvc.png"
         ma_plot = plot_dir / f"{cname}_magic_access.png"
 
-        if (out_file.exists() and fvc_plot.exists() and ma_plot.exists()
-                and not args.force):
+        plots_exist = args.skip_plots or (fvc_plot.exists() and ma_plot.exists())
+        if out_file.exists() and plots_exist and not args.force:
             logger.info("[%d/%d] %s — already exists, skipping (use --force to re-run)",
                         idx, total, cname)
             try:
@@ -729,7 +899,7 @@ def main():
             continue
 
         # If JSON exists but plots are missing, reload and just generate plots
-        if out_file.exists() and not args.force:
+        if out_file.exists() and not args.force and not args.skip_plots:
             logger.info("[%d/%d] %s — JSON exists, generating missing plots ...",
                         idx, total, cname)
             try:
@@ -748,7 +918,14 @@ def main():
         logger.info("[%d/%d] Processing %s (%d qubits, depth %s) ...",
                     idx, total, cname, record["num_qubits"], record.get("depth", "?"))
         try:
-            result = process_circuit(record)
+            result = process_circuit(
+                record,
+                schedulers=selected_schedulers,
+                source_labels=selected_sources,
+                layout_preset=args.layout_preset,
+                run_magic_access=not args.skip_magic_access,
+                schedules_dir=schedules_dir,
+            )
             if result is None:
                 continue
 
@@ -756,10 +933,11 @@ def main():
                 json.dump(result, f, indent=2, default=str)
             logger.info("  Saved → %s", out_file)
 
-            create_fvc_plot(result["factory_vs_cultivation_results"],
-                           cname, str(fvc_plot))
-            create_ma_plot(result["magic_access_results"],
-                          cname, str(ma_plot))
+            if not args.skip_plots:
+                create_fvc_plot(result["factory_vs_cultivation_results"],
+                               cname, str(fvc_plot))
+                create_ma_plot(result["magic_access_results"],
+                              cname, str(ma_plot))
 
             all_results.append(result)
         except Exception as e:
