@@ -61,4 +61,15 @@ benchmark_circuits/**
 *.pdf
 *.json
 *.csv
+*.trans
+*.trans0
+/results/*.qasm
+*.qasm
+*.txt
+*.schedule
 routing_experiment_results/**
+
+# Local validation and generated example artifacts.
+/tests/
+/examples/
+/sota_comparison_matched_ir/**

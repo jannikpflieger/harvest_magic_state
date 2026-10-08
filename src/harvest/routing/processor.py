@@ -431,7 +431,8 @@ class DAGProcessor:
         Args:
             dag: The DAG circuit to process
             visualize_each_step: Whether to visualize each Steiner solution
-            mode: "steiner_tree", "steiner_packing", or "steiner_pathfinder"
+            mode: "steiner_tree", "steiner_packing", "steiner_pathfinder",
+                "harvest", or "silva_eaf"
 
         Returns:
             list: Results from processing all nodes
@@ -444,6 +445,11 @@ class DAGProcessor:
             return process_dag_with_pathfinder(self, dag, visualize_each_step)
         elif mode == "harvest":
             return process_dag_with_harvest(self, dag, visualize_each_step)
+        elif mode == "silva_eaf":
+            # Local import avoids a package-initialization cycle while keeping
+            # the paper baseline isolated from HARVEST scheduler code.
+            from harvest.baselines.silva import process_dag_with_silva_eaf
+            return process_dag_with_silva_eaf(self, dag, visualize_each_step)
         else:
             raise ValueError(f"Unknown processing mode: {mode}")
 
@@ -534,7 +540,7 @@ class DAGProcessor:
 
         summary += f"Used magic terminals: {len(self.used_magic_terminals)}/{len(self.magic_terminals)}\n"
 
-        if mode in ["steiner_packing", "steiner_pathfinder"] and self.processing_results:
+        if mode in ["steiner_packing", "steiner_pathfinder", "harvest", "silva_eaf"] and self.processing_results:
             time_steps = set()
             for result in successful_results:
                 if 'time_step' in result:

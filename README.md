@@ -86,3 +86,74 @@ Run `python -m harvest <command> --help` for full option lists.
 - [Qiskit](https://qiskit.org/) (circuit representation, transpiler passes)
 - NetworkX, Matplotlib, NumPy, Pandas, Seaborn
 - Optional: [BQSKit](https://bqskit.lbl.gov/), [MQT Bench](https://github.com/cda-tum/mqt-bench)
+
+## Reproducing the SOTA baseline comparison
+
+The comparison driver keeps the three scientifically distinct regimes
+(`matched_ir`, `matched_architecture`, and `native_end_to_end`) separate and
+stores one JSON record per trial:
+
+```bash
+PYTHONPATH=src python src/scripts/compare_sota_baselines.py \
+  --benchmarks benchmark_circuits/qasm/qaoa \
+  --baselines harvest,silva,puremagic,dascot \
+  --comparison-mode matched_ir \
+  --trials 20 --seed 42 \
+  --output-dir results/sota_comparison
+```
+
+HARVEST and the in-tree `silva_eaf` reproduction need no additional tool.
+For the external baselines:
+
+1. Build the official [BQSKit/PureMagic](https://github.com/BQSKit/PureMagic)
+   paper snapshot (the upstream project identifies it as `QCE`) with
+   `cargo build --release`. Pass its scheduler with `--puremagic-bin`; for a
+   native QASM pipeline also pass `--puremagic-transpile-bin` and, when the
+   source is not already Clifford+T, `--puremagic-compile-bin`. If the QCE ref
+   is unavailable, check out an explicit commit and pass that identity through
+   `--puremagic-version`; the adapter will not relabel an observed `main`
+   banner as the paper snapshot. Custom topology files can be supplied with
+   `--puremagic-topology` and are copied into the per-run artifact directory.
+2. Install the official [qqq-wisc/wisq](https://github.com/qqq-wisc/wisq)
+   package, preferably the recorded `v0.2.7` tag, and pass `--wisq-bin` if it
+   is not on `PATH`. The adapter always invokes `--mode scmr`, so GUOQ circuit
+   optimization is not mixed into the mapping/routing result. wisq's `setup.py`
+   requires `gcc` and `java >= 21` to be importable at install time (it shells
+   out to both just to check versions); install a JDK first if `pip install`
+   fails with `ValueError: invalid literal for int() with base 10: ''`.
+
+```bash
+python -m pip install "git+https://github.com/qqq-wisc/wisq.git@v0.2.7"
+```
+
+For a quick in-tree smoke test:
+
+```bash
+PYTHONPATH=src python src/scripts/compare_sota_baselines.py \
+  --benchmarks examples/sota_baselines \
+  --baselines harvest,silva \
+  --comparison-mode matched_ir --trials 1 \
+  --output-dir results/sota_smoke
+
+# Re-running does not execute completed trials again.
+PYTHONPATH=src python src/scripts/compare_sota_baselines.py \
+  --benchmarks examples/sota_baselines \
+  --baselines harvest,silva \
+  --comparison-mode matched_ir --trials 1 \
+  --output-dir results/sota_smoke --resume
+
+# Optional real-upstream smoke tests (normal tests use fixtures/mocks).
+RUN_EXTERNAL_BASELINES=1 PUREMAGIC_BIN=/path/to/puremagic \
+  WISQ_BIN=/path/to/wisq PYTHONPATH=src \
+  pytest -m integration tests/test_external_baselines_integration.py
+```
+
+Outputs include raw trials, successful-trial counts, failure records, 95%
+confidence intervals, paper-ready PDFs, pairwise shared-subset geometric means,
+and complete environment/version metadata. See
+[`docs/sota_baselines.md`](docs/sota_baselines.md) before interpreting any
+cross-system ratio; DASCOT cycles and PPR scheduler cycles are not the same
+compilation problem.
+
+The checked-in tiny run and its plots are under
+[`examples/sota_baselines/example_results`](examples/sota_baselines/example_results).
