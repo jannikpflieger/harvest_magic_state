@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import importlib.metadata
 import json
 import logging
@@ -18,6 +19,7 @@ import platform
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Sequence
@@ -70,6 +72,22 @@ DISPLAY = {
     ("dascot", "dascot_square_sparse"): "DASCOT Square Sparse",
     ("dascot", "dascot_compact"): "DASCOT Compact",
     ("dascot", "matched_architecture"): "DASCOT Matched Architecture",
+    # Multi-configuration baselines: every variant is one configuration of the
+    # same compiler, so the trade-off plot draws them as one frontier.
+    ("litinski", "litinski_compact"): "Litinski",
+    ("litinski", "litinski_intermediate"): "Litinski",
+    ("litinski", "litinski_fast"): "Litinski",
+    ("o3ls", "o3ls_min"): "O3LS",
+    ("o3ls", "o3ls_medium"): "O3LS",
+    ("o3ls", "o3ls_large"): "O3LS",
+    ("taco", "taco_k1"): "TACO",
+    ("taco", "taco_k2"): "TACO",
+    ("taco", "taco_k4"): "TACO",
+    ("lsqca", "lsqca_point_b1"): "LSQCA",
+    ("lsqca", "lsqca_point_b2"): "LSQCA",
+    ("lsqca", "lsqca_line_b1"): "LSQCA",
+    ("lsqca", "lsqca_line_b2"): "LSQCA",
+    ("lsqca", "lsqca_line_b4"): "LSQCA",
 }
 COLORS = {
     "HARVEST": "#4C72B0",
@@ -80,7 +98,11 @@ COLORS = {
     "PureMagic": "#C44E52",
     "DASCOT Square Sparse": "#8172B3",
     "DASCOT Compact": "#937860",
-    "DASCOT Matched Architecture": "#64B5CD",
+    "DASCOT Matched Architecture": "#B07AA1",
+    "Litinski": "#DA8BC3",
+    "O3LS": "#CCB974",
+    "LSQCA": "#64B5CD",
+    "TACO": "#8C8C8C",
 }
 
 
@@ -108,6 +130,10 @@ def load_benchmark(path: Path):
     return circuit, create_dag(pcb)
 
 
+LAYOUT_PRESETS = ("ring", "ring_large_spacing", "one_side_magic", "fixed_magic", "blocks4",
+                  "blocks4_one_side_magic", "blocks4_sparse_ring", "dense")
+
+
 def build_layout(
     num_qubits: int,
     rows: Optional[int],
@@ -115,7 +141,25 @@ def build_layout(
     dag,
     placement: str,
     seed: int,
+    preset: str = "ring",
+    magic_count: int = 2,
 ):
+    """Build the HARVEST/Silva layout.
+
+    ``preset`` is the resource knob for space/time sweeps; every preset uses
+    one-tile patches (so DASCOT matched_architecture stays applicable):
+    ``ring`` (default) data grid with 1-tile spacing and a magic ring;
+    ``ring_large_spacing`` 2-tile spacing; ``one_side_magic`` magic on the top
+    edge only; ``fixed_magic`` exactly ``magic_count`` magic patches on the top
+    edge; ``blocks4`` dense 2x2 data blocks (``blocks4_one_side_magic``: magic on
+    the top edge only; ``blocks4_sparse_ring``: as many magic patches, spread
+    over all four edges); ``dense`` the ~2.25 tiles/qubit
+    comb layout with ``magic_count`` magic ports (``presets.dense_comb_layout``).
+    """
+    from harvest.layout import presets
+
+    if preset == "dense":
+        return presets.dense_comb_layout(num_qubits, magic_count)
     if placement == "circuit_aware":
         from harvest.synthesis.placement import PlacementConfig
         from harvest.synthesis.synthesizer import StaticLayoutSynthesizer
@@ -128,28 +172,96 @@ def build_layout(
         engine, _ = synthesizer.synthesize(dag)
         return engine
 
-    resolved_cols = cols or max(1, math.ceil(math.sqrt(num_qubits)))
-    resolved_rows = rows or max(1, math.ceil(num_qubits / resolved_cols))
-    if resolved_cols * resolved_rows < num_qubits:
+    from harvest.layout import presets
+
+    slots_per_cell = 4 if preset.startswith("blocks4") else 1
+    cells = math.ceil(num_qubits / slots_per_cell)
+    resolved_cols = cols or max(1, math.ceil(math.sqrt(cells)))
+    resolved_rows = rows or max(1, math.ceil(cells / resolved_cols))
+    if resolved_cols * resolved_rows * slots_per_cell < num_qubits:
         raise ValueError(
-            f"layout {resolved_rows}x{resolved_cols} has fewer data patches than {num_qubits} qubits"
+            f"layout {resolved_rows}x{resolved_cols} ({preset}) has fewer data patches "
+            f"than {num_qubits} qubits"
         )
-    return nxm_ring_layout_single_qubits(resolved_cols, resolved_rows)
+    if preset == "ring":
+        return nxm_ring_layout_single_qubits(resolved_cols, resolved_rows)
+    if preset == "ring_large_spacing":
+        return presets.nxm_ring_layout_single_qubits_large_spacing(resolved_cols, resolved_rows)
+    if preset == "one_side_magic":
+        return presets.nxm_one_side_magic_layout_single_qubits(resolved_cols, resolved_rows)
+    if preset == "fixed_magic":
+        return presets.nxm_fixed_magic_count_layout_single_qubits(
+            resolved_cols, resolved_rows, magic_count
+        )
+    if preset == "blocks4":
+        return presets.blocks_of_four_qubit_patches(resolved_cols, resolved_rows)
+    if preset == "blocks4_one_side_magic":
+        return presets.blocks_of_four_qubit_patches(resolved_cols, resolved_rows, magic_side="top")
+    if preset == "blocks4_sparse_ring":
+        # as many magic patches as blocks4_one_side_magic has on its top edge
+        # (3 * cols + 1), spread evenly over all four edges
+        return presets.blocks_of_four_qubit_patches(
+            resolved_cols, resolved_rows, magic_ring_count=3 * resolved_cols + 1
+        )
+    raise ValueError(f"unknown layout preset {preset!r}")
 
 
 def raw_result_path(raw_dir: Path, config: BaselineRunConfig) -> Path:
     return raw_dir / deterministic_result_name(config)
 
 
-def should_resume(path: Path, config: Optional[BaselineRunConfig] = None) -> bool:
-    """Resume only a completed trial with the same normalized configuration."""
+# Fields that define *what* a trial computed.  Paths, timeouts, executable
+# locations and the recorded upstream version are provenance: they stay in every
+# raw record but do not invalidate a stored result (use --force-rerun after
+# changing a baseline's code).
+RESUME_IDENTITY_FIELDS = (
+    "baseline",
+    "variant",
+    "circuit",
+    "comparison_mode",
+    "num_qubits",
+    "trial",
+    "seed",
+    "options",
+    "input_sha256",
+)
+
+
+@dataclass
+class ResumePolicy:
+    retry_failed: bool = True
+    force_rerun: frozenset = frozenset()
+
+
+RESUME_POLICY = ResumePolicy()
+
+
+def should_resume(
+    path: Path,
+    config: Optional[BaselineRunConfig] = None,
+    *,
+    retry_failed: Optional[bool] = None,
+) -> bool:
+    """Reuse a stored trial whose identity fields match ``config``.
+
+    Completed trials are always reused.  Failed trials are reused only when
+    ``retry_failed`` is false (``--keep-failed``); dry-run placeholders never.
+    """
+    retry = RESUME_POLICY.retry_failed if retry_failed is None else retry_failed
     if not path.exists():
+        return False
+    if config is not None and config.baseline in RESUME_POLICY.force_rerun:
         return False
     try:
         payload = json.loads(path.read_text())
-        if payload.get("result", {}).get("completed") is not True:
-            return False
-        return config is None or payload.get("config") == config.serializable()
+        result = payload.get("result", {})
+        if result.get("completed") is not True:
+            if retry or str(result.get("error", "")).startswith("dry-run"):
+                return False
+        if config is None:
+            return True
+        stored, current = payload.get("config", {}), config.serializable()
+        return all(stored.get(key) == current.get(key) for key in RESUME_IDENTITY_FIELDS)
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -231,6 +343,10 @@ def _parse_baselines(value: str) -> List[str]:
         "silva_eaf": "silva",
         "puremagic": "puremagic",
         "dascot": "dascot",
+        "litinski": "litinski",
+        "o3ls": "o3ls",
+        "lsqca": "lsqca",
+        "taco": "taco",
     }
     selected = []
     for item in value.split(","):
@@ -260,12 +376,18 @@ def _config(
         "silva": "Silva et al., TQC 2024",
         "puremagic": args.puremagic_version,
         "dascot": args.wisq_version,
+        "litinski": "Litinski, Quantum 3, 128 (2019)",
+        "o3ls": "O3LS reimplementation (Zhu et al., ISCA 2026; no public artifact)",
+        "lsqca": "LSQCA reimplementation (Kobori et al., HPCA 2025; no public artifact)",
+        "taco": args.nwqec_version,
     }
     executable = None
     if baseline == "puremagic" and args.puremagic_bin:
         executable = Path(args.puremagic_bin)
     elif baseline == "dascot" and args.wisq_bin:
         executable = Path(args.wisq_bin)
+    elif baseline == "taco" and args.taco_bin:
+        executable = Path(args.taco_bin)
     return BaselineRunConfig(
         baseline=baseline,
         variant=variant,
@@ -281,6 +403,31 @@ def _config(
         upstream_version=versions[baseline],
         options=options or {},
     )
+
+
+def _magic_options(args) -> Dict[str, Any]:
+    """Magic-state model in a config; the free default keeps old configs unchanged."""
+    if args.magic_model == "free":
+        return {}
+    return {"magic_model": args.magic_model, "cultivation_mean_cycles": args.cultivation_mean_cycles}
+
+
+def _model_trials(args) -> List[tuple]:
+    """(trial, seed) pairs for in-tree models: one deterministic run, or seeded
+    trials once cultivation makes them stochastic."""
+    if args.magic_model == "free":
+        return [(0, None)]
+    return [(t, args.seed + t) for t in range(args.cultivation_trials)]
+
+
+def _layout_options(args) -> Dict[str, Any]:
+    """Layout knobs recorded in a config; the default keeps old configs unchanged."""
+    if args.layout_preset == "ring":
+        return {}
+    options: Dict[str, Any] = {"layout_preset": args.layout_preset}
+    if args.layout_preset in ("fixed_magic", "dense"):
+        options["layout_magic_count"] = args.layout_magic_count
+    return options
 
 
 def _dry_result(config: BaselineRunConfig) -> BaselineResult:
@@ -588,6 +735,8 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             dag,
             args.placement,
             args.seed,
+            args.layout_preset,
+            args.layout_magic_count,
         )
         harvest_frontend_runtime = perf_counter() - frontend_started
     except Exception as exc:
@@ -607,7 +756,9 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             SilvaEAFAdapter(),
         ),
     ]
-    for baseline, variant, adapter in deterministic:
+    for (baseline, variant, adapter), (trial, seed) in (
+        (entry, ts) for entry in deterministic for ts in _model_trials(args)
+    ):
         if baseline not in selected:
             continue
         config = _config(
@@ -616,13 +767,15 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             variant=variant,
             circuit=path,
             num_qubits=circuit.num_qubits,
-            trial=0,
-            seed=None,
+            trial=trial,
+            seed=seed,
             options={
                 "placement": args.placement,
                 "placement_seed": args.seed if circuit_aware else None,
                 "requested_rows": args.rows,
                 "requested_cols": args.cols,
+                **_layout_options(args),
+                **_magic_options(args),
             },
         )
         execute_config(
@@ -640,6 +793,55 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             ),
         )
 
+    # Matched-IR reimplementations/models that consume the same Pauli-product DAG.
+    for baseline, module, cls in (
+        ("litinski", "harvest.baselines.litinski", "LitinskiAdapter"),
+        ("o3ls", "harvest.baselines.o3ls", "O3LSAdapter"),
+    ):
+        if baseline not in selected:
+            continue
+        mod = importlib.import_module(module)
+        for variant in mod.VARIANTS:
+            for trial, seed in _model_trials(args):
+                config = _config(
+                    args=args,
+                    baseline=baseline,
+                    variant=variant,
+                    circuit=path,
+                    num_qubits=circuit.num_qubits,
+                    trial=trial,
+                    seed=seed,
+                    options=_magic_options(args),
+                )
+                execute_config(
+                    getattr(mod, cls)(), config, raw_dir,
+                    resume=args.resume, dry_run=args.dry_run, dag=dag,
+                )
+
+    # Gate-level architecture models consuming the Clifford+T source (native_end_to_end).
+    for baseline, module, cls in (
+        ("lsqca", "harvest.baselines.lsqca", "LSQCAAdapter"),
+        ("taco", "harvest.baselines.taco", "TACOAdapter"),
+    ):
+        if baseline not in selected:
+            continue
+        mod = importlib.import_module(module)
+        for variant in mod.VARIANTS:
+            config = _config(
+                args=args,
+                baseline=baseline,
+                variant=variant,
+                circuit=path,
+                num_qubits=circuit.num_qubits,
+                trial=0,
+                seed=None,
+                options={"code_distance": args.code_distance},
+            )
+            execute_config(
+                getattr(mod, cls)(), config, raw_dir,
+                resume=args.resume, dry_run=args.dry_run,
+            )
+
     if "puremagic" in selected:
         trans_path = output_dir / "inputs" / f"{safe_name(path.stem)}.trans"
         conversion_error = None
@@ -654,7 +856,14 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
                 native = args.comparison_mode == "native_end_to_end"
                 options = {
                     "input_format": "qasm" if native else "trans",
-                    "magic_state_lambda": args.magic_state_lambda,
+                    # Common cultivation model: PureMagic's native Exp(1/lambda)
+                    # cultivation with the shared mean.
+                    "magic_state_lambda": (
+                        1.0 / args.cultivation_mean_cycles
+                        if args.magic_model == "cultivation"
+                        else args.magic_state_lambda
+                    ),
+                    **_magic_options(args),
                     "ancilla_rows": args.ancilla_rows,
                     "no_t_failures": args.puremagic_no_t_failures,
                     "transpile_bin": args.puremagic_transpile_bin,
@@ -752,6 +961,7 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
                             "placement_seed": args.seed if circuit_aware else None,
                             "requested_rows": args.rows,
                             "requested_cols": args.cols,
+                            **_layout_options(args),
                         }
                         if args.comparison_mode == "matched_architecture"
                         else {
@@ -789,6 +999,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--circuit", help="Only run a circuit whose filename/stem contains this text"
     )
+    parser.add_argument(
+        "--skip-circuits", default="",
+        help="Comma-separated circuit names (exact file stems) to leave out, e.g. ones too "
+             "expensive to run.",
+    )
     parser.add_argument("--baselines", default="harvest,silva,puremagic,dascot")
     parser.add_argument(
         "--comparison-mode",
@@ -799,7 +1014,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-circuits", type=int)
     parser.add_argument("--timeout", type=float, default=1800.0)
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Reuse stored trials whose identity (baseline, variant, circuit, "
+                             "mode, trial, seed, options, input SHA-256) matches.")
+    parser.add_argument("--keep-failed", action="store_true",
+                        help="With --resume, also reuse recorded failures instead of retrying them.")
+    parser.add_argument("--force-rerun", default="",
+                        help="Comma-separated baselines to recompute even if stored "
+                             "(e.g. after changing their code).")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", default="results/sota_comparison")
     parser.add_argument("--rows", type=int)
@@ -810,6 +1032,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="row_major",
         help="Circuit-aware placement is a separately identified matched-placement experiment.",
     )
+    parser.add_argument(
+        "--layout-preset",
+        choices=LAYOUT_PRESETS,
+        default="ring",
+        help="HARVEST/Silva (and DASCOT matched_architecture) layout; a resource-sweep knob.",
+    )
+    parser.add_argument("--layout-magic-count", type=int, default=2,
+                        help="Magic patches for --layout-preset fixed_magic.")
+    parser.add_argument(
+        "--magic-model", choices=["free", "cultivation"], default="free",
+        help="free: magic states always ready (matched-IR default); cultivation: every "
+             "compiler's magic ports cultivate states with Exp(mean) cycles "
+             "(harvest.baselines.cultivation; PureMagic gets lambda = 1/mean).",
+    )
+    parser.add_argument("--cultivation-mean-cycles", type=float, default=3.0)
+    parser.add_argument("--cultivation-trials", type=int, default=5,
+                        help="Seeded trials for HARVEST/Silva/Litinski/O3LS under cultivation.")
     parser.add_argument("--puremagic-bin")
     parser.add_argument("--puremagic-transpile-bin")
     parser.add_argument("--puremagic-compile-bin")
@@ -818,6 +1057,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--magic-state-lambda", type=float, default=0.0387396)
     parser.add_argument("--ancilla-rows", type=int, default=1)
     parser.add_argument("--puremagic-no-t-failures", action="store_true")
+    parser.add_argument("--taco-bin", help="nwqec-cli of an isolated nwqec install (TACO pass)")
+    parser.add_argument("--nwqec-version", default="nwqec (TACO transpiler, pnnl/nwqec)")
+    parser.add_argument("--code-distance", type=int, default=13,
+                        help="Code distance used by models whose latencies are in QEC rounds (TACO).")
     parser.add_argument("--wisq-bin")
     parser.add_argument("--wisq-version", default="v0.2.7")
     parser.add_argument(
@@ -855,6 +1098,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    RESUME_POLICY.retry_failed = not args.keep_failed
+    RESUME_POLICY.force_rerun = frozenset(
+        b.strip() for b in args.force_rerun.split(",") if b.strip()
+    )
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
@@ -881,6 +1128,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if args.circuit:
         circuits = [path for path in circuits if args.circuit in path.name]
+    skip = {name.strip() for name in args.skip_circuits.split(",") if name.strip()}
+    if skip:
+        skipped = sorted(path.stem for path in circuits if path.stem in skip)
+        circuits = [path for path in circuits if path.stem not in skip]
+        logger.info("skipping %d circuit(s) by request: %s", len(skipped), ", ".join(skipped))
     if args.max_circuits:
         circuits = circuits[: args.max_circuits]
     if not circuits:

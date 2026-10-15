@@ -14,9 +14,10 @@ from time import perf_counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from harvest.compilation.utils import node_needs_magic_state
-from harvest.routing.scheduler import get_ready_nodes
+from harvest.routing.scheduler import ReadyTracker
 
 from .base import BaselineAdapter, BaselineResult, BaselineRunConfig
+from .cultivation import cultivation_mean, make_cultivator
 from .metrics import space_time_volume
 
 logger = logging.getLogger("HarvestMagicState.SilvaEAF")
@@ -151,23 +152,30 @@ def process_dag_with_silva_eaf(processor, dag, visualize_each_step: bool = False
     validate_silva_ir(dag)
     all_nodes = list(dag.op_nodes())
     processed = set()
+    tracker = ReadyTracker(dag, all_nodes)
     results: List[Dict[str, Any]] = []
     timestep = 0
     failure_reasons: Dict[str, str] = {}
 
-    if processor.magic_source is not None:
-        logger.warning(
-            "silva_eaf uses Silva's static, continuously replenished magic-storage "
-            "assumption; the configured dynamic magic source is ignored"
-        )
+    # Silva's paper assumes storage sites replenished every timestep (no
+    # source).  With a source (the common cultivation regime) a site is only
+    # offered while it holds a ready state, exactly as for HARVEST.
+    factory = processor.magic_source
+    waited = 0
 
     while len(processed) < len(all_nodes):
-        ready = get_ready_nodes(dag, all_nodes, processed)
+        ready = tracker.ready()
         if not ready:
             break
+        if factory is not None:
+            factory.tick()
 
         working_graph = _copy_graph(processor.graph)
-        available_magic = list(processor.magic_terminals)
+        if factory is None or factory.unlimited:
+            available_magic = list(processor.magic_terminals)
+        else:
+            ready_sites = set(factory.get_ready_terminals())
+            available_magic = [t for t in processor.magic_terminals if t in ready_sites]
         scheduled_this_step = []
 
         for order_index, node in enumerate(ready):
@@ -183,6 +191,8 @@ def process_dag_with_silva_eaf(processor, dag, visualize_each_step: bool = False
             magic_terminal = routed.get("magic_terminal")
             if magic_terminal in available_magic:
                 available_magic.remove(magic_terminal)
+            if factory is not None and not factory.unlimited and magic_terminal is not None:
+                factory.consume(magic_terminal)
             _remove_routing_nodes(working_graph, routed["steiner_nodes"])
 
             result = {
@@ -198,6 +208,15 @@ def process_dag_with_silva_eaf(processor, dag, visualize_each_step: bool = False
             results.append(result)
             scheduled_this_step.append(node)
 
+        if not scheduled_this_step and factory is not None and not factory.unlimited and any(
+            node_needs_magic_state(node) for node in ready
+        ) and len(available_magic) < len(processor.magic_terminals):
+            # Every magic-requiring candidate waits for a state still cultivating.
+            factory.record_wait_cycle()
+            waited += 1
+            timestep += 1
+            continue
+
         if not scheduled_this_step:
             logger.warning(
                 "Silva EAF made no progress at timestep %d; %d ready operations are unroutable",
@@ -207,6 +226,8 @@ def process_dag_with_silva_eaf(processor, dag, visualize_each_step: bool = False
             break
 
         processed.update(scheduled_this_step)
+        for node in scheduled_this_step:
+            tracker.mark_done(node)
         timestep += 1
 
     processor.used_magic_terminals = {
@@ -224,7 +245,12 @@ def process_dag_with_silva_eaf(processor, dag, visualize_each_step: bool = False
         "final_unroutable_reasons": failure_reasons,
         "dependency_policy": "DAG roots (trivial/no-shared-data dependency semantics)",
         "candidate_order": "stable input order",
-        "magic_state_model": "static storage, replenished each logical timestep",
+        "magic_state_model": (
+            "static storage, replenished each logical timestep"
+            if factory is None or factory.unlimited
+            else "common cultivation model (storage sites wait for cultivated states)"
+        ),
+        "magic_wait_steps": waited,
     }
     return results
 
@@ -293,6 +319,9 @@ class SilvaEAFAdapter(BaselineAdapter):
 
         start = perf_counter()
         processor = DAGProcessor(layout_engine=layout_engine)
+        mean = cultivation_mean(config.options)
+        if mean is not None:
+            processor.magic_source = make_cultivator(processor.magic_terminals, mean, config.seed)
         results = processor.process_entire_dag(dag, mode="silva_eaf")
         runtime = perf_counter() - start
         metadata = dict(getattr(processor, "_scheduling_metadata", {}))
@@ -313,7 +342,11 @@ class SilvaEAFAdapter(BaselineAdapter):
         ]
         notes = [
             "No HARVEST negotiated-congestion optimization or pruning was used.",
-            "Static magic-storage patches are available again each logical timestep.",
+            (
+                "Static magic-storage patches are available again each logical timestep."
+                if mean is None
+                else f"Common cultivation model: each storage site waits Exp(mean={mean}) cycles after use."
+            ),
             "Stable input ordering replaces the paper's unspecified random candidate draw.",
             "Peak memory is null because in-process memory instrumentation is not enabled.",
         ]
@@ -333,7 +366,7 @@ class SilvaEAFAdapter(BaselineAdapter):
             compiler_runtime_s=runtime,
             completed=completed,
             trial=config.trial,
-            seed=None,
+            seed=config.seed if mean is not None else None,
             upstream_version="Silva et al., TQC 2024 (Algorithms 1–2)",
             command="DAGProcessor.process_entire_dag(mode='silva_eaf')",
             notes=notes,

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple
+from typing import Optional, Tuple
 
 from harvest.layout.engine import LayoutEngine, magic_patch_1cell, data_patch_1cell
 
@@ -131,7 +131,10 @@ def nxm_ring_layout_single_qubits_large_spacing(n: int, m: int, *, start_with: s
     return eng
 
 
-def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_xz: bool = False) -> LayoutEngine:
+def blocks_of_four_qubit_patches(
+    n: int, m: int, *, start_with: str = "X", swap_xz: bool = False,
+    magic_side: Optional[str] = None, magic_ring_count: Optional[int] = None,
+) -> LayoutEngine:
     """
     Build an n x m grid layout with blocks of 4-qubit patches and a ring of magic states around it.
     
@@ -140,6 +143,10 @@ def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_
     - Spacing: 1 patch between adjacent blocks
     - Magic ring: magic state patches on the boundary, 1 patch spacing from the blocks
     - Magic ports face inward (toward the center)
+    - ``magic_side`` ("top", "bottom", "left", "right"): magic patches on that
+      edge only instead of the full ring
+    - ``magic_ring_count``: exactly that many magic patches, spread evenly over
+      the four edges
 
     Grid dimensions:
     - Each block occupies a 3x3 area (2x2 for qubits + 1 for spacing)
@@ -175,6 +182,17 @@ def blocks_of_four_qubit_patches(n: int, m: int, *, start_with: str = "X", swap_
             for p in block_patches:
                 eng.add_patch(p)
             qubit_idx += 4
+
+    if magic_ring_count is not None:
+        # Spread exactly ``magic_ring_count`` patches over the four edges;
+        # the remainder goes to top, bottom, left, right in that order.
+        base, extra = divmod(magic_ring_count, 4)
+        for k, side in enumerate(("top", "bottom", "left", "right")):
+            _add_magic_fixed_count(eng, W, H, base + (k < extra), side=side)
+        return eng
+    if magic_side is not None:
+        _add_magic_one_side(eng, W, H, side=magic_side)
+        return eng
 
     for x in range(1, W - 1):
         eng.add_patch(magic_patch_1cell(f"mT{x}", (x, 0), side="S"))
@@ -341,4 +359,73 @@ def nxm_fixed_magic_count_layout_single_qubits_large_spacing(
             qubit_idx += 1
 
     _add_magic_fixed_count(eng, W, H, num_magic, side=side)
+    return eng
+
+
+def dense_comb_layout(num_qubits: int, num_magic: int = 2, *, swap_xz: bool = False) -> LayoutEngine:
+    """Dense layout (~2.25 tiles per qubit) where every data patch keeps X and Z access.
+
+    Columns repeat ``R D D`` and end with ``R`` (R = routing column spanning
+    all rows); rows repeat bands of ``D R D`` (data row, routing row, data
+    row).  Every single-cell data patch (X ports N/S, Z ports E/W) therefore
+    touches the routing row on its N or S side and a routing column on its E
+    or W side, so X-, Z- and Y-type products stay routable without patch
+    rotations.  A 3x3 block holds four qubits and five routing cells, versus
+    the ring presets' one-tile spacing around every patch plus a full magic
+    ring.
+
+    Magic patches sit in an extra top row directly above the routing columns
+    (port facing S); the remaining cells of that row are blocked so they add
+    no routing space.  ``num_magic`` ports are spread evenly over the
+    ``units + 1`` routing columns; if more are requested, a bottom magic row is
+    added the same way.
+
+    Grid: ``W = 3*units + 1``, ``H = 3*bands + 1 (+1)``, chosen near-square with
+    ``4 * units * bands >= num_qubits``.  Unused data slots stay free cells.
+    """
+    if num_qubits < 1:
+        raise ValueError("num_qubits must be positive")
+    if num_magic < 1:
+        raise ValueError("num_magic must be at least 1")
+    best = None
+    for bands in range(1, num_qubits + 1):
+        units = -(-num_qubits // (4 * bands))
+        W, H = 3 * units + 1, 3 * bands + 1
+        key = (W * H, abs(W - H))
+        if best is None or key < best[0]:
+            best = (key, units, bands)
+        if 4 * bands > num_qubits:
+            break
+    _, units, bands = best
+    ports_per_row = units + 1
+    bottom_row = num_magic > ports_per_row
+    W = 3 * units + 1
+    H = 3 * bands + 1 + (1 if bottom_row else 0)
+    top = 1  # data/routing rows start below the magic row
+    eng = LayoutEngine(W, H)
+
+    qubit_idx = 0
+    for band in range(bands):
+        for y in (top + 3 * band, top + 3 * band + 2):  # the two data rows of the band
+            for unit in range(units):
+                for x in (3 * unit + 1, 3 * unit + 2):
+                    if qubit_idx < num_qubits:
+                        eng.add_patch(data_patch_1cell(f"q_{qubit_idx}", (x, y), swap_xz=swap_xz))
+                        qubit_idx += 1
+
+    def magic_row(y: int, count: int, side: str, prefix: str) -> None:
+        columns = [3 * u for u in range(units + 1)]
+        if count >= len(columns):
+            chosen = columns
+        elif count == 1:
+            chosen = [columns[len(columns) // 2]]
+        else:
+            chosen = [columns[round(i * (len(columns) - 1) / (count - 1))] for i in range(count)]
+        for x in chosen:
+            eng.add_patch(magic_patch_1cell(f"{prefix}{x}", (x, y), side=side))
+        eng.add_blocked({(x, y) for x in range(W) if x not in chosen})
+
+    magic_row(0, min(num_magic, ports_per_row), "S", "mT")
+    if bottom_row:
+        magic_row(H - 1, num_magic - ports_per_row, "N", "mB")
     return eng

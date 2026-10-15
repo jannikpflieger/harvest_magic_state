@@ -12,6 +12,19 @@ detailed_logger = logging.getLogger('HarvestMagicState.Detailed')
 # Maximum consecutive idle cycles (waiting for magic states) before giving up.
 _MAX_IDLE_CYCLES = 500
 
+# HARVEST scheduling policies.
+#   PRIORITY: order in which ready products compete for magic terminals and
+#     routing space -- "dag_order" (DAG order) or "critical_path" (longest
+#     remaining dependency chain first, ties in DAG order).
+#   ROUTER_PRIORITY: also route high-priority products first and, when the
+#     congestion loop must drop products, drop the lowest-priority ones.
+#   TERMINALS: magic-terminal assignment -- "nearest" (greedy per product,
+#     Euclidean distance) or "matching" (one optimal assignment of free
+#     terminals to products minimizing total routing distance).
+HARVEST_PRIORITY = "critical_path"
+HARVEST_ROUTER_PRIORITY = True
+HARVEST_TERMINALS = "matching"
+
 
 def get_ready_nodes(dag, all_op_nodes, processed_nodes):
     """Get all nodes ready for execution (no unprocessed predecessors)."""
@@ -28,6 +41,62 @@ def get_ready_nodes(dag, all_op_nodes, processed_nodes):
             ready_nodes.append(node)
 
     return ready_nodes
+
+
+class ReadyTracker:
+    """Incremental :func:`get_ready_nodes`: same nodes, same (DAG) order.
+
+    ``get_ready_nodes`` rescans every operation and its predecessors at every
+    time step, which is quadratic in the circuit size.  The tracker keeps the
+    number of unprocessed predecessors per node and updates it when a node is
+    marked done, so a step costs only the size of the ready set.
+    """
+
+    def __init__(self, dag, all_op_nodes):
+        self._nodes = list(all_op_nodes)
+        index = {node._node_id: i for i, node in enumerate(self._nodes)}
+        self._successors = [[] for _ in self._nodes]
+        self._missing = [0] * len(self._nodes)
+        for i, node in enumerate(self._nodes):
+            preds = {index[p._node_id] for p in dag.predecessors(node) if hasattr(p, 'op')}
+            self._missing[i] = len(preds)
+            for p in preds:
+                self._successors[p].append(i)
+        self._index = index
+        self._ready = {i for i, m in enumerate(self._missing) if m == 0}
+        self._done = [False] * len(self._nodes)
+        self.num_done = 0
+
+    def ready(self):
+        return [self._nodes[i] for i in sorted(self._ready)]
+
+    def heights(self):
+        """{node_id: longest chain of operations from the node to a sink (>= 1)}."""
+        missing = list(self._missing)
+        order = [i for i, m in enumerate(missing) if m == 0]
+        for i in order:  # Kahn's algorithm; ``order`` grows while iterating
+            for j in self._successors[i]:
+                missing[j] -= 1
+                if missing[j] == 0:
+                    order.append(j)
+        height = [1] * len(self._nodes)
+        for i in reversed(order):
+            for j in self._successors[i]:
+                if height[j] + 1 > height[i]:
+                    height[i] = height[j] + 1
+        return {self._nodes[i]._node_id: height[i] for i in range(len(self._nodes))}
+
+    def mark_done(self, node):
+        i = self._index[node._node_id]
+        if self._done[i]:
+            return
+        self._done[i] = True
+        self.num_done += 1
+        self._ready.discard(i)
+        for j in self._successors[i]:
+            self._missing[j] -= 1
+            if self._missing[j] == 0:
+                self._ready.add(j)
 
 
 def process_dag_sequential(processor, dag, visualize_each_step=False):
@@ -344,6 +413,85 @@ def _filter_by_magic_availability(ready_nodes, factory, ready_terminals=None):
     return executable
 
 
+def _magic_distances(processor):
+    """Routing distance from every magic terminal to every node (layout is static)."""
+    cache = getattr(processor, '_magic_distance_cache', None)
+    if cache is None:
+        cache = {t: processor.eng._dijkstra(processor.graph, t)[0] for t in processor.magic_terminals}
+        processor._magic_distance_cache = cache
+    return cache
+
+
+def _port_specs(processor, dag, node):
+    """[(patch, [port types])] of a product, as ``_get_qubit_terminals_with_magic_direction``
+    derives them; cached per node because they do not depend on the magic terminal."""
+    cache = processor.__dict__.setdefault('_port_spec_cache', {})
+    specs = cache.get(node._node_id)
+    if specs is None:
+        specs = []
+        qubit_indices = [dag.find_bit(q).index for q in node.qargs]
+        for qubit_index in qubit_indices:
+            patch_name = f"q_{qubit_index}"
+            if patch_name not in processor.ports_by_patch:
+                continue
+            port_type = processor._get_port_type_for_pauli_gate(node, qubit_index, qubit_indices)
+            specs.append((patch_name, ['X', 'Z'] if port_type == 'Y' else [port_type]))
+        cache[node._node_id] = specs
+    return specs
+
+
+def _oriented_terminals(processor, specs, magic_terminal):
+    """Same ports as ``_get_qubit_terminals_with_magic_direction`` for these specs."""
+    terminals = []
+    for patch_name, port_types in specs:
+        for port_type in port_types:
+            port = processor._get_best_oriented_port(patch_name, port_type, magic_terminal)
+            if port:
+                terminals.append(port)
+    return terminals
+
+
+def _assign_terminals_matching(processor, dag, ready_nodes, available_magic):
+    """Optimal product -> magic-terminal assignment for one time step.
+
+    The first ``len(available_magic)`` products (in priority order) that have
+    data ports receive a terminal; the assignment minimizes the total routing
+    distance (sum over the product's oriented data ports of the shortest-path
+    length from the magic terminal), unlike the greedy nearest choice, which
+    lets an early product take the terminal a later one needs most.
+    Returns ``[(node, magic_terminal, qubit_terminals)]`` in ready order.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    if not available_magic:
+        return []
+    dist = _magic_distances(processor)
+    unreachable = 10 ** 6
+    rows = []  # (node, {terminal: qubit_terminals}, [cost per terminal])
+    for node in ready_nodes:
+        if len(rows) == len(available_magic):
+            break
+        options, costs = {}, []
+        specs = _port_specs(processor, dag, node)
+        for t in available_magic:
+            qts = _oriented_terminals(processor, specs, t)
+            options[t] = qts
+            costs.append(sum(dist[t].get(p, unreachable) for p in qts) if qts else 10 * unreachable)
+        if not any(options.values()):
+            continue
+        rows.append((node, options, costs))
+    if not rows:
+        return []
+    assigned_rows, assigned_cols = linear_sum_assignment([costs for _, _, costs in rows])
+    chosen = {}
+    for r, c in zip(assigned_rows, assigned_cols):
+        node, options, _ = rows[r]
+        t = available_magic[c]
+        if options[t]:
+            chosen[r] = (node, t, options[t])
+    return [chosen[r] for r in sorted(chosen)]
+
+
 def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
     """Prepare terminal sets for packing/pathfinder algorithms.
 
@@ -360,25 +508,38 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
     node_to_terminals = {}
     temp_used_magic = processor.used_magic_terminals.copy()
 
-    # Unlimited mode (no magic source or unlimited source) should not enforce
-    # one-time terminal usage within a time step. Otherwise dense layers can
-    # spuriously report "No magic terminals available" even though magic is
-    # configured as always available.
-    factory = getattr(processor, "magic_source", None)
-    enforce_unique_magic = not (factory is None or getattr(factory, "unlimited", False))
+    # A magic patch can serve at most one product per time step, also when
+    # states are always ready (no source / unlimited source): routes must be
+    # node-disjoint, so two products sharing a magic terminal cannot both
+    # succeed.  Handing the same terminal to several products made all but
+    # one fail and retry next step (~80% of failed routings on dense
+    # layouts).  Products beyond the number of terminals simply wait for the
+    # next step, exactly as in Silva's EAF baseline.
+    ready_set = set(ready_terminals) if ready_terminals is not None else None
+
+    if getattr(processor, '_terminal_policy', 'nearest') == 'matching':
+        available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
+        if ready_set is not None:
+            available_magic = [t for t in available_magic if t in ready_set]
+        for node, magic_terminal, qubit_terminals in _assign_terminals_matching(
+            processor, dag, ready_nodes, available_magic
+        ):
+            terminals = [magic_terminal] + qubit_terminals
+            terminal_sets.append(terminals)
+            node_to_terminals[node] = {
+                'magic_terminal': magic_terminal,
+                'qubit_terminals': qubit_terminals,
+                'all_terminals': terminals,
+            }
+        return terminal_sets, node_to_terminals
 
     for node in ready_nodes:
-        if enforce_unique_magic:
-            available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
-            if ready_terminals is not None:
-                ready_set = set(ready_terminals)
-                available_magic = [t for t in available_magic if t in ready_set]
-        else:
-            available_magic = list(processor.magic_terminals)
+        available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
+        if ready_set is not None:
+            available_magic = [t for t in available_magic if t in ready_set]
 
         if not available_magic:
-            # This can happen only in constrained mode.
-            logger.warning(f"No magic terminals available for node {node.op.name}")
+            logger.debug(f"No free magic terminal left this step for node {node.op.name}")
             continue
 
         dummy_magic = available_magic[0]
@@ -395,12 +556,11 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
             logger.warning(f"No suitable magic terminal found for node {node.op.name}")
             continue
 
-        if enforce_unique_magic:
-            temp_used_magic.add(magic_terminal)
+        temp_used_magic.add(magic_terminal)
 
         qubit_terminals = processor._get_qubit_terminals_with_magic_direction(dag, node, magic_terminal)
         if not qubit_terminals:
-            if enforce_unique_magic and magic_terminal in temp_used_magic:
+            if magic_terminal in temp_used_magic:
                 temp_used_magic.remove(magic_terminal)
             continue
 
@@ -514,6 +674,126 @@ def _process_time_step_with_pathfinder(processor, dag, ready_nodes, time_step, w
     return time_step_results
 
 
+def _free_components(graph, blocked):
+    """{node: component id} of ``graph`` without ``blocked`` (graph is symmetric)."""
+    label = {}
+    for root in graph:
+        if root in label or root in blocked:
+            continue
+        label[root] = root
+        stack = [root]
+        while stack:
+            u = stack.pop()
+            for v, _ in graph.get(u, ()):
+                if v not in label and v not in blocked:
+                    label[v] = root
+                    stack.append(v)
+    return label
+
+
+def _retry_failed_with_other_magic(
+    processor, dag, graph, results, ready_terminals=None, ready_nodes=(), time_step=None
+):
+    """Re-route failed products through another free magic terminal (in place).
+
+    Magic terminals are assigned before routing; a product whose assigned
+    terminal cannot be reached around the routes committed this step was
+    simply deferred, even when another magic patch was free and reachable.
+    Silva's EAF attaches the nearest *reachable* free site instead.  This pass
+    gives every failed product that chance: free terminals are tried nearest
+    first, the data ports are re-oriented toward each candidate, and the
+    product is routed on the graph without the routing cells already used in
+    this step.
+
+    Ready products that never received a terminal (more products than free
+    terminals at assignment time) are tried as well, after the failed ones:
+    a terminal left free by an unroutable product must not stay unused while
+    another ready product could take it.
+    """
+    attempted = {r["node"] for r in results}
+    for node in ready_nodes:
+        if node not in attempted:
+            results.append({
+                "node": node, "gate_name": node.op.name, "qubits": [],
+                "time_step": time_step, "success": False, "magic_wait_cycles": 0,
+                "magic_terminal": None, "qubit_terminals": [], "all_terminals": [],
+                "steiner_nodes": set(), "steiner_edges": set(),
+                "error": "no magic terminal assigned", "_unassigned": True,
+            })
+    failed = [r for r in results if not r["success"]]
+    if not failed:
+        return
+    committed = set()
+    used_magic = set()
+    for r in results:
+        if r["success"]:
+            committed |= {n for n in r["steiner_nodes"] if isinstance(n, tuple)}
+            used_magic.add(r["magic_terminal"])
+    allowed = set(ready_terminals) if ready_terminals is not None else None
+    # The routing graph is symmetric, so a Steiner tree exists iff all its
+    # terminals share a component of the free graph: candidates that fail this
+    # test are skipped without running the (much costlier) Steiner search.
+    components = None
+    for r in failed:
+        node = r["node"]
+        candidates = [
+            t for t in processor.magic_terminals
+            if t not in used_magic and t != r["magic_terminal"]
+            and (allowed is None or t in allowed)
+        ]
+        if not candidates:
+            continue
+        anchor = [processor.pos.get(t) for t in r["qubit_terminals"] if t in processor.pos]
+        if not anchor:  # never assigned: anchor at the product's data patches
+            qubits = [dag.find_bit(q).index for q in node.qargs]
+            anchor = [
+                processor.pos[t]
+                for q in qubits
+                for t in processor.ports_by_patch.get(f"q_{q}", [])
+                if t in processor.pos
+            ]
+
+        def distance(t):
+            p = processor.pos.get(t)
+            if p is None or not anchor:
+                return 0.0
+            return min(abs(p[0] - a[0]) + abs(p[1] - a[1]) for a in anchor)
+
+        for magic in sorted(candidates, key=distance):
+            qubit_terminals = processor._get_qubit_terminals_with_magic_direction(dag, node, magic)
+            if not qubit_terminals:
+                continue
+            terminals = [magic] + qubit_terminals
+            if components is None:
+                components = _free_components(graph, committed)
+            label = components.get(magic)
+            if label is None or any(components.get(t) != label for t in qubit_terminals):
+                continue
+            try:
+                sol_nodes, sol_edges = processor.eng.steiner_tree(
+                    graph, terminals, blocked=committed
+                )
+            except (ValueError, KeyError):
+                continue
+            r.update(
+                success=True,
+                magic_terminal=magic,
+                qubit_terminals=qubit_terminals,
+                all_terminals=terminals,
+                steiner_nodes=sol_nodes,
+                steiner_edges=sol_edges,
+                magic_retry=True,
+            )
+            r.pop("error", None)
+            r.pop("_unassigned", None)
+            committed |= {n for n in sol_nodes if isinstance(n, tuple)}
+            components = None
+            used_magic.add(magic)
+            processor.used_magic_terminals.add(magic)
+            break
+    results[:] = [r for r in results if not r.get("_unassigned")]
+
+
 def _process_time_step_with_harvest(
     processor, dag, ready_nodes, time_step, working_graph,
     visualize_each_step, ready_terminals=None
@@ -536,6 +816,12 @@ def _process_time_step_with_harvest(
         logger.warning(f"No valid terminal sets for time step {time_step}")
         return []
 
+    priorities = None
+    heights = getattr(processor, '_node_heights', None)
+    if heights is not None and getattr(processor, '_router_priority', False):
+        nodes_with_terminals = [n for n in ready_nodes if n in node_to_terminals]
+        priorities = [heights[n._node_id] for n in nodes_with_terminals]
+
     logger.info(f"Running HARVEST on {len(terminal_sets)} terminal sets")
     packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
         working_graph,
@@ -545,6 +831,7 @@ def _process_time_step_with_harvest(
         beta=1.5,
         stagnation_limit=2,
         greedy_order="min_size",
+        priorities=priorities,
     )
     logger.info(
         f"HARVEST step {time_step}: iters={harvest_stats['iterations']}, "
@@ -555,6 +842,11 @@ def _process_time_step_with_harvest(
 
     time_step_results = _collect_time_step_results(
         processor, ready_nodes, node_to_terminals, packing_results, time_step
+    )
+
+    _retry_failed_with_other_magic(
+        processor, dag, working_graph, time_step_results, ready_terminals,
+        ready_nodes=ready_nodes, time_step=time_step,
     )
 
     # Attach HARVEST-specific metadata to every result in this time step.
@@ -606,6 +898,15 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
     idle_streak = 0
     all_op_nodes = list(dag.op_nodes())
     factory = processor.magic_source
+    tracker = ReadyTracker(dag, all_op_nodes)
+    processor._terminal_policy = HARVEST_TERMINALS
+    processor._router_priority = HARVEST_ROUTER_PRIORITY
+    heights = None
+    if HARVEST_PRIORITY == "critical_path":
+        heights = tracker.heights()
+    elif HARVEST_PRIORITY != "dag_order":
+        raise ValueError(f"unknown HARVEST_PRIORITY {HARVEST_PRIORITY!r}")
+    processor._node_heights = heights
 
     while len(processed_nodes) < len(all_op_nodes):
         logger.info(f"=== Time Step {time_step} ===")
@@ -615,11 +916,14 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
 
         processor.used_magic_terminals = set()
 
-        ready_nodes = get_ready_nodes(dag, all_op_nodes, processed_nodes)
+        ready_nodes = tracker.ready()
 
         if not ready_nodes:
             logger.warning("No ready nodes found, breaking to avoid infinite loop")
             break
+        if heights is not None:
+            # Stable: equal heights keep DAG order.
+            ready_nodes.sort(key=lambda n: -heights[n._node_id])
 
         ready_terminals = (
             factory.get_ready_terminals()
@@ -665,6 +969,7 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
         for result in time_step_results:
             if result['success']:
                 processed_nodes.add(result['node'])
+                tracker.mark_done(result['node'])
                 all_results.append(result)
                 successful_nodes.append(result['node'])
                 if factory and not factory.unlimited and node_needs_magic_state(result['node']):

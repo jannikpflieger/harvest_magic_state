@@ -71,6 +71,22 @@ def geometric_sampler(p: float) -> ReadinessSampler:
     return _sample
 
 
+def exponential_sampler(mean_cycles: float) -> ReadinessSampler:
+    """Exponential cultivation time with the given mean, rounded, clamped to >= 1.
+
+    Same distribution family as PureMagic's cultivation model (``Exp`` with
+    scale ``1/lambda``, rounded); a consumed state cannot be replaced within
+    the same cycle, hence the lower clamp of one cycle.
+    """
+    if mean_cycles <= 0:
+        raise ValueError("mean_cycles must be > 0")
+
+    def _sample(rng: random.Random) -> int:
+        return max(1, round(rng.expovariate(1.0 / mean_cycles)))
+
+    return _sample
+
+
 def lognormal_sampler(mean_cycles: float, std_cycles: float) -> ReadinessSampler:
     """Log-normal sampler (rounded to an integer, clamped to >= 1).
 

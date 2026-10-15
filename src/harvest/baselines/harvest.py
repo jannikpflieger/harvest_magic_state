@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Any
+from typing import Any, Optional
 
 from .base import BaselineAdapter, BaselineResult, BaselineRunConfig
+from .cultivation import cultivation_mean, make_cultivator
 from .metrics import space_time_volume
 
 
@@ -15,12 +16,24 @@ def layout_patch_count(layout_engine) -> int:
     return layout_engine.W * layout_engine.H - blocked
 
 
-def processor_patch_count(processor) -> int:
-    """Count retained routing tiles plus retained data/magic patch tiles."""
+def processor_patch_count(processor, num_qubits: Optional[int] = None) -> int:
+    """Count retained routing tiles plus retained data/magic patch tiles.
+
+    Pruning drops every patch the schedule never routed to, including the data
+    patch of a logical qubit that no Pauli product touches.  Such a qubit still
+    holds state, so with ``num_qubits`` its data patch ``q_<i>`` is counted
+    even when pruned.  Unbound layout slots (``q_<i>`` with ``i >= num_qubits``)
+    stay pruned.
+    """
     routing_tiles = sum(isinstance(node, tuple) for node in processor.graph)
+    retained = set(processor.ports_by_patch)
+    if num_qubits is not None:
+        retained |= {f"q_{i}" for i in range(num_qubits)}
     retained_patch_tiles = 0
-    for name in processor.ports_by_patch:
+    for name in retained:
         patch = processor.eng.patches.get(name)
+        if patch is None and name not in processor.ports_by_patch:
+            raise ValueError(f"layout has no data patch {name} for a register qubit")
         retained_patch_tiles += len(patch.cells) if patch is not None else 1
     return routing_tiles + retained_patch_tiles
 
@@ -40,12 +53,19 @@ class HarvestAdapter(BaselineAdapter):
         initial_patches = layout_patch_count(layout_engine)
         started = perf_counter()
         processor = DAGProcessor(layout_engine=layout_engine)
+        mean = cultivation_mean(config.options)
+        if mean is not None:
+            # Common cultivation model: every magic patch cultivates one state
+            # at a time (see harvest.baselines.cultivation).
+            processor.magic_source = make_cultivator(processor.magic_terminals, mean, config.seed)
         results = processor.process_entire_dag(dag, mode="harvest")
         metadata = dict(getattr(processor, "_scheduling_metadata", {}))
         completed = bool(metadata.get("completed", False))
         length = metadata.get("total_elapsed_steps") if completed else None
         pruning_stats = processor.prune_after_scheduling(results) if completed else None
-        post_patches = processor_patch_count(processor) if completed else None
+        post_patches = (
+            processor_patch_count(processor, config.num_qubits) if completed else None
+        )
         scheduler_runtime = perf_counter() - started
         runtime = preprocessing_runtime + scheduler_runtime
         wirelength = sum(len(result.get("steiner_edges", ())) for result in results)
@@ -74,12 +94,13 @@ class HarvestAdapter(BaselineAdapter):
             compiler_runtime_s=runtime,
             completed=completed,
             trial=config.trial,
-            seed=None,
+            seed=config.seed if mean is not None else None,
             upstream_version=config.upstream_version,
             command="DAGProcessor.process_entire_dag(mode='harvest')",
             notes=[
                 "Pruning is applied only after scheduling and does not change schedule length.",
                 "Both initial and post-pruning patch counts/space-time values are reported.",
+                "Post-pruning patches keep every register qubit's data patch, even if no product touches it.",
                 "Peak memory is null because in-process memory instrumentation is not enabled.",
                 "Runtime includes frontend/layout in native_end_to_end and only scheduling/pruning otherwise.",
             ],

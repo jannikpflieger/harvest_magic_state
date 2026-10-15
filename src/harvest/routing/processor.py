@@ -156,7 +156,22 @@ class DAGProcessor:
     # ------------------------------------------------------------------
 
     def _get_best_oriented_port(self, data_patch_name, port_type, magic_terminal):
-        """Get the best oriented port on a data patch based on magic state position."""
+        """Get the best oriented port on a data patch based on magic state position.
+
+        Memoized: the answer depends only on the layout (``ports_by_patch``,
+        ``pos``), which is fixed while scheduling; the cache is keyed by the
+        identity of ``ports_by_patch`` so a pruned layout starts a fresh one.
+        """
+        cache = getattr(self, '_oriented_port_cache', None)
+        if cache is None or cache[0] is not self.ports_by_patch:
+            cache = (self.ports_by_patch, {})
+            self._oriented_port_cache = cache
+        key = (data_patch_name, port_type, magic_terminal)
+        if key not in cache[1]:
+            cache[1][key] = self._compute_best_oriented_port(data_patch_name, port_type, magic_terminal)
+        return cache[1][key]
+
+    def _compute_best_oriented_port(self, data_patch_name, port_type, magic_terminal):
         if data_patch_name not in self.ports_by_patch:
             return None
         if port_type not in self.ports_by_patch[data_patch_name]:

@@ -187,7 +187,7 @@ class LayoutEngine:
     
 
 
-    def _dijkstra(self, graph, source, targets=None):
+    def _dijkstra(self, graph, source, targets=None, node_cost=None, blocked=None):
         """
         Standard Dijkstra on the adjacency-list `graph`.
 
@@ -198,23 +198,30 @@ class LayoutEngine:
             graph: {node: [(nbr, weight), ...]}
             source: start node
             targets: optional set of nodes; if provided, the search stops once all targets are finalized.
+            node_cost: optional {node: cost} added to the weight of every edge entering
+                that node, i.e. the search runs on ``w + node_cost.get(v, 0.0)`` without
+                materializing a reweighted graph.
+            blocked: optional set of nodes treated as absent from the graph (as if
+                every edge into them were removed).
 
         Returns:
             dist: {node: distance}
             prev: {node: predecessor on shortest path from source}
         """
-        import heapq
+        from heapq import heappop, heappush
         INF = 10**18
         dist = {source: 0}
         prev = {}
-        pq = []
+        pq = [(0, 0, source)]
         tie = 0
-        heapq.heappush(pq, (0, tie, source))
         remaining = set(targets) if targets is not None else None
+        dist_get = dist.get
+        graph_get = graph.get
+        cost_get = node_cost.get if node_cost else None
 
         while pq:
-            d, _, u = heapq.heappop(pq)
-            if d != dist.get(u, INF):
+            d, _, u = heappop(pq)
+            if d != dist_get(u, INF):
                 continue
 
             if remaining is not None and u in remaining:
@@ -222,13 +229,17 @@ class LayoutEngine:
                 if not remaining:
                     break
 
-            for v, w in graph.get(u, []):
+            for v, w in graph_get(u, ()):
+                if blocked is not None and v in blocked:
+                    continue
+                if cost_get is not None:
+                    w = w + cost_get(v, 0.0)
                 nd = d + w
-                if nd < dist.get(v, INF):
+                if nd < dist_get(v, INF):
                     dist[v] = nd
                     prev[v] = u
                     tie += 1
-                    heapq.heappush(pq, (nd, tie, v))
+                    heappush(pq, (nd, tie, v))
 
         return dist, prev
 
@@ -248,11 +259,11 @@ class LayoutEngine:
         path.reverse()
         return path
 
-    def _edge_weight(self, graph, u, v, default=1):
+    def _edge_weight(self, graph, u, v, default=1, node_cost=None):
         """Lookup edge weight for (u,v) in the directed adjacency list."""
         for nbr, w in graph.get(u, []):
             if nbr == v:
-                return w
+                return w + node_cost.get(v, 0.0) if node_cost else w
         return default
 
     def _mst_prim_terminals(self, terminals, dist_lookup):
@@ -290,7 +301,7 @@ class LayoutEngine:
 
         return edges
 
-    def steiner_tree(self, graph, terminals, *, prune_cycles=True):
+    def steiner_tree(self, graph, terminals, *, prune_cycles=True, node_cost=None, blocked=None):
         """
         Approximate Steiner tree (Kou-Markowsky-Berman style metric-closure MST):
           1) compute shortest paths between terminals
@@ -304,6 +315,9 @@ class LayoutEngine:
             graph: adjacency list {node: [(nbr, w), ...]}
             terminals: iterable of terminal nodes (ports or routing cells)
             prune_cycles: if True, prune union subgraph down to a tree that still connects all terminals
+            node_cost: optional {node: cost} added to every edge entering that node
+                (congestion penalties) without rebuilding the graph
+            blocked: optional set of non-terminal nodes treated as removed
 
         Returns:
             sol_nodes: set of nodes used by the solution
@@ -320,7 +334,7 @@ class LayoutEngine:
         prev_from = {}
         tset = set(terminals)
         for s in terminals:
-            d, p = self._dijkstra(graph, s, targets=tset)
+            d, p = self._dijkstra(graph, s, targets=tset, node_cost=node_cost, blocked=blocked)
             dist_from[s] = d
             prev_from[s] = p
 
@@ -342,7 +356,10 @@ class LayoutEngine:
 
             sol_nodes.update(path)
             for a, b in zip(path[:-1], path[1:]):
-                w = self._edge_weight(graph, a, b, default=self._edge_weight(graph, b, a, default=1))
+                w = self._edge_weight(
+                    graph, a, b, node_cost=node_cost,
+                    default=self._edge_weight(graph, b, a, default=1, node_cost=node_cost),
+                )
                 x, y = (a, b) if str(a) <= str(b) else (b, a)
                 if (x, y) not in undirected_edges_w or w < undirected_edges_w[(x, y)]:
                     undirected_edges_w[(x, y)] = w
@@ -762,6 +779,8 @@ class LayoutEngine:
         prune_cycles: bool = True,
         greedy_order: str = "min_size",
         seed: int | None = None,
+        greedy_fill: bool = True,
+        priorities=None,
     ):
         if seed is not None:
             random.seed(seed)
@@ -787,18 +806,12 @@ class LayoutEngine:
             tset = set(terminals)
             return {n for n in sol_nodes if isinstance(n, tuple) and n not in tset}
 
-        def _build_weighted_graph(base_graph, node_cost):
-            wg = {}
-            for u, nbrs in base_graph.items():
-                out = []
-                for v, w in nbrs:
-                    out.append((v, w + node_cost.get(v, 0.0)))
-                wg[u] = out
-            return wg
-
         def _order_indices(sets):
             indexed = list(enumerate(sets))
-            if greedy_order == "min_size":
+            if priorities is not None:
+                # High priority first, then the size heuristic.
+                indexed.sort(key=lambda x: (-priorities[x[0]], len(x[1])))
+            elif greedy_order == "min_size":
                 indexed.sort(key=lambda x: len(x[1]))
             elif greedy_order == "max_size":
                 indexed.sort(key=lambda x: len(x[1]), reverse=True)
@@ -818,13 +831,12 @@ class LayoutEngine:
         stats_iterations = 0
         stopped_reason = "max_iters"
 
-        node_cost = {}
-        weighted_graph = _build_weighted_graph(base_graph, node_cost)
-
+        # Congestion costs are applied on the fly (``node_cost``) instead of
+        # rebuilding a reweighted copy of the graph for every reroute.
         for i, terminals in indexed_sets:
             try:
                 sol_nodes, sol_edges = self.steiner_tree(
-                    weighted_graph, terminals, prune_cycles=prune_cycles
+                    base_graph, terminals, prune_cycles=prune_cycles
                 )
                 routes[i] = {
                     "terminal_set": terminals,
@@ -902,12 +914,11 @@ class LayoutEngine:
                     if h > 0.0:
                         node_cost[n] = node_cost.get(n, 0.0) + beta * h
 
-                weighted_graph = _build_weighted_graph(base_graph, node_cost)
-
                 # Reroute with updated penalties.
                 try:
                     sol_nodes, sol_edges = self.steiner_tree(
-                        weighted_graph, terminals, prune_cycles=prune_cycles
+                        base_graph, terminals, prune_cycles=prune_cycles,
+                        node_cost=node_cost,
                     )
                     routes[i] = {
                         "terminal_set": terminals,
@@ -955,6 +966,9 @@ class LayoutEngine:
                 route_size = len(rnodes)
 
                 score = (conflict_count, route_size)
+                if priorities is not None and conflict_count > 0:
+                    # Drop the lowest-priority conflicting net first.
+                    score = (1, -priorities[i], conflict_count, route_size)
                 if score > best_score:
                     best_score = score
                     best_i = i
@@ -971,6 +985,38 @@ class LayoutEngine:
 
             dropped.add(best_i)
             overfull = current_overfull_nodes()
+
+        # --- Greedy completion: retry dropped/unrouted nets in leftover space --
+        # Dropping whole nets can leave routing capacity unused: a dropped (or
+        # initially unroutable) net may still fit around the committed routes.
+        # Retrying each such net, in greedy order, on the graph without the
+        # committed routing cells makes the packing maximal (never worse than a
+        # sequential greedy packing of the same nets on what is left).
+        stats_filled = 0
+        if greedy_fill:
+            committed = set()
+            for i, terminals in indexed_sets:
+                if routes[i] and routes[i].get("success", False) and i not in dropped:
+                    committed |= _routing_nodes_used(routes[i]["sol_nodes"], terminals)
+            for i, terminals in indexed_sets:
+                if routes[i] and routes[i].get("success", False) and i not in dropped:
+                    continue
+                try:
+                    sol_nodes, sol_edges = self.steiner_tree(
+                        base_graph, terminals, prune_cycles=prune_cycles,
+                        blocked=committed,
+                    )
+                except (ValueError, KeyError):
+                    continue
+                routes[i] = {
+                    "terminal_set": terminals,
+                    "sol_nodes": sol_nodes,
+                    "sol_edges": sol_edges,
+                    "success": True,
+                }
+                dropped.discard(i)
+                committed |= _routing_nodes_used(sol_nodes, terminals)
+                stats_filled += 1
 
         # --- Build outputs and remaining graph (commit packed nets) ----------
 
@@ -1026,6 +1072,7 @@ class LayoutEngine:
             "reroutes": stats_reroutes,
             "conflicted_reroutes": stats_conflicted_reroutes,
             "dropped": len(dropped),
+            "filled": stats_filled,
             "final_conflict_score": final_conflict_score,
             "stopped_reason": stopped_reason,
         }

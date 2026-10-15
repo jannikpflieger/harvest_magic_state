@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -149,6 +150,42 @@ def validate_wisq_qasm(path: Path) -> None:
         )
 
 
+_WISQ_CX = re.compile(r"(cx)\s+q\[(\d+)\],\s*q\[(\d+)\];")
+_WISQ_T = re.compile(r"(t|tdg)\s+q\[(\d+)\];")
+
+
+def normalize_wisq_registers(source: Path, target: Path) -> Path:
+    """Write ``source`` with one quantum register named ``q`` for wisq.
+
+    wisq's ``extract_gates_from_file`` only matches gates on a register
+    literally named ``q`` and silently drops all others, after which DASCOT's
+    mapper fails with a ``KeyError`` (or would route an incomplete circuit).
+    This exact rename (qubit order preserved) is verified by re-counting the
+    CX/T/Tdg gates with wisq's own patterns.
+    """
+    from qiskit import QuantumCircuit, qasm2
+
+    circuit = QuantumCircuit.from_qasm_file(str(source))
+    renamed = QuantumCircuit(circuit.num_qubits, circuit.num_clbits)
+    renamed.compose(
+        circuit,
+        qubits=list(range(circuit.num_qubits)),
+        clbits=list(range(circuit.num_clbits)),
+        inplace=True,
+    )
+    text = qasm2.dumps(renamed)
+    ops = circuit.count_ops()
+    seen_cx = sum(bool(_WISQ_CX.match(line)) for line in text.splitlines())
+    seen_t = sum(bool(_WISQ_T.match(line)) for line in text.splitlines())
+    if seen_cx != ops.get("cx", 0) or seen_t != ops.get("t", 0) + ops.get("tdg", 0):
+        raise ValueError(
+            f"wisq would parse {seen_cx} CX / {seen_t} T gates but the circuit has "
+            f"{ops.get('cx', 0)} / {ops.get('t', 0) + ops.get('tdg', 0)}"
+        )
+    target.write_text(text)
+    return target
+
+
 def _resolve_executable(path: Optional[Path]) -> Optional[str]:
     candidate = str(path) if path is not None else "wisq"
     if Path(candidate).is_file():
@@ -195,6 +232,7 @@ class DASCOTAdapter(BaselineAdapter):
         started = perf_counter()
         try:
             validate_wisq_qasm(config.input_path)
+            wisq_input = normalize_wisq_registers(config.input_path, work_dir / "input_q.qasm")
             if config.comparison_mode == "matched_architecture":
                 if layout_engine is None:
                     raise ValueError(
@@ -217,7 +255,7 @@ class DASCOTAdapter(BaselineAdapter):
 
             command = [
                 executable,
-                str(config.input_path.resolve()),
+                str(wisq_input),
                 "--mode",
                 "scmr",
                 "--architecture",
@@ -257,6 +295,7 @@ class DASCOTAdapter(BaselineAdapter):
                 "DASCOT has no CLI seed option, so the requested seed cannot be enforced.",
                 "Schedule cycles operate on CX/T dependencies, not HARVEST's PPR stream.",
                 "Logical patch count is the full architecture width × height, including magic sites.",
+                "wisq received an exact single-register (`q`) copy of the input (input_q.qasm); its parser ignores other register names.",
                 "Peak memory is null because wisq's JSON/CLI output does not report it.",
                 "The upstream version is declared by --wisq-version; wisq result JSON does not self-identify a commit.",
             ]
