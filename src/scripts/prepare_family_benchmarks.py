@@ -36,7 +36,7 @@ for path in (PROJECT_ROOT / "src", SCRIPT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from qiskit import QuantumCircuit, qasm2  # noqa: E402
+from qiskit import QuantumCircuit, qasm2, transpile  # noqa: E402
 from qiskit.quantum_info import Operator, process_fidelity  # noqa: E402
 
 from prepare_cliffordt_benchmarks import (  # noqa: E402
@@ -69,6 +69,23 @@ def is_exact(circuit: QuantumCircuit) -> bool:
     except ValueError:
         return False
     return set(rewritten.count_ops()) <= EXACT_SOURCE_GATES | EXACT_EXTRA
+
+
+def expand_custom_gates(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Inline user-defined gates (``gate majority a,b,c {...}``) into standard gates.
+
+    Without this a circuit built from custom gates looks non-exact and is sent
+    to the synthesizer, which returns an empty circuit for gates it does not know.
+    """
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    standard = set(get_standard_gate_name_mapping())
+    for _ in range(10):
+        custom = {i.operation.name for i in circuit.data} - standard
+        if not custom:
+            return circuit
+        circuit = circuit.decompose(gates_to_decompose=sorted(custom))
+    raise ValueError(f"cannot expand custom gates {sorted(custom)}")
 
 
 def single_register(circuit: QuantumCircuit) -> QuantumCircuit:
@@ -113,14 +130,19 @@ def main(argv=None) -> int:
                 print(f"{source.stem}: previously over budget, skipped")
                 continue
             try:
-                circuit = single_register(strip(source))
+                circuit = single_register(expand_custom_gates(strip(source)))
             except ValueError as exc:
                 skipped[source.stem] = {"original_sha256": sha256(source), "reason": str(exc)}
                 print(f"{source.stem}: refused ({exc})")
                 continue
             stripped = Path(tmp) / name
-            stripped.write_text(qasm2.dumps(circuit))
             exact = is_exact(circuit)
+            # The synthesizer only understands a small gate set; it silently returns
+            # an empty circuit for e.g. cry/ryy/cswap, so approximate inputs are first
+            # rewritten (exactly) into Clifford + rz.
+            stripped.write_text(qasm2.dumps(circuit if exact else transpile(
+                circuit, basis_gates=["cx", "h", "s", "sdg", "x", "y", "z", "rz"],
+                optimization_level=0)))
             if exact:
                 to_lower, epsilon = stripped, None
             else:
@@ -129,6 +151,12 @@ def main(argv=None) -> int:
                                 str(stripped)], check=True, capture_output=True)
                 to_lower.write_text(qasm2.dumps(QuantumCircuit.from_qasm_file(str(to_lower))))
             check = QuantumCircuit.from_qasm_file(str(to_lower))
+            if check.num_qubits != circuit.num_qubits:
+                skipped[source.stem] = {"original_sha256": sha256(source), "epsilon": epsilon,
+                                        "reason": f"front end returned {check.num_qubits} qubits "
+                                                  f"for a {circuit.num_qubits}-qubit circuit"}
+                print(f"{source.stem}: front end output has {check.num_qubits} qubits, skipped")
+                continue
             ops = check.count_ops()
             t_est = ops.get("t", 0) + ops.get("tdg", 0) + 7 * (ops.get("ccx", 0) + ops.get("cswap", 0))
             if t_est > args.max_t:

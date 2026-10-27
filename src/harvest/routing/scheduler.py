@@ -4,7 +4,9 @@ DAG traversal and time-step scheduling strategies for routing.
 
 import logging
 
+from harvest import faults
 from harvest.compilation.utils import node_needs_magic_state
+from .config import HarvestConfig
 
 logger = logging.getLogger('HarvestMagicState.DAGProcessor')
 detailed_logger = logging.getLogger('HarvestMagicState.Detailed')
@@ -12,18 +14,7 @@ detailed_logger = logging.getLogger('HarvestMagicState.Detailed')
 # Maximum consecutive idle cycles (waiting for magic states) before giving up.
 _MAX_IDLE_CYCLES = 500
 
-# HARVEST scheduling policies.
-#   PRIORITY: order in which ready products compete for magic terminals and
-#     routing space -- "dag_order" (DAG order) or "critical_path" (longest
-#     remaining dependency chain first, ties in DAG order).
-#   ROUTER_PRIORITY: also route high-priority products first and, when the
-#     congestion loop must drop products, drop the lowest-priority ones.
-#   TERMINALS: magic-terminal assignment -- "nearest" (greedy per product,
-#     Euclidean distance) or "matching" (one optimal assignment of free
-#     terminals to products minimizing total routing distance).
-HARVEST_PRIORITY = "critical_path"
-HARVEST_ROUTER_PRIORITY = True
-HARVEST_TERMINALS = "matching"
+# HARVEST scheduling policies are fields of ``HarvestConfig`` (routing/config.py).
 
 
 def get_ready_nodes(dag, all_op_nodes, processed_nodes):
@@ -86,6 +77,11 @@ class ReadyTracker:
                     height[i] = height[j] + 1
         return {self._nodes[i]._node_id: height[i] for i in range(len(self._nodes))}
 
+    def blocked(self):
+        """Not-yet-done nodes with at least one unprocessed predecessor (DAG order)."""
+        return [self._nodes[i] for i, m in enumerate(self._missing)
+                if m > 0 and not self._done[i]]
+
     def mark_done(self, node):
         i = self._index[node._node_id]
         if self._done[i]:
@@ -95,7 +91,7 @@ class ReadyTracker:
         self._ready.discard(i)
         for j in self._successors[i]:
             self._missing[j] -= 1
-            if self._missing[j] == 0:
+            if self._missing[j] == 0 and not self._done[j]:
                 self._ready.add(j)
 
 
@@ -172,6 +168,7 @@ def process_dag_sequential(processor, dag, visualize_each_step=False):
                 factory.consume(result['magic_terminal'])
 
             result['magic_wait_cycles'] = 0  # sequential; wait captured via idle steps
+            result['time_step'] = step
             results.append(result)
 
         processed_nodes.add(node)
@@ -435,6 +432,10 @@ def _port_specs(processor, dag, node):
             if patch_name not in processor.ports_by_patch:
                 continue
             port_type = processor._get_port_type_for_pauli_gate(node, qubit_index, qubit_indices)
+            if port_type == 'Y' and faults.active("drop_y_port"):
+                faults.note("drop_y_port")
+                specs.append((patch_name, ['X']))
+                continue
             specs.append((patch_name, ['X', 'Z'] if port_type == 'Y' else [port_type]))
         cache[node._node_id] = specs
     return specs
@@ -573,6 +574,16 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
         }
 
     return terminal_sets, node_to_terminals
+
+
+def _inject_reuse_terminal(processor, results):
+    """Fault ``reuse_terminal``: commit two products of one step on the same terminal."""
+    routed = [r for r in results if r['success'] and r.get('magic_terminal') is not None]
+    if len(routed) < 2 or not faults.fire_once(processor, "reuse_terminal"):
+        return
+    shared = routed[0]['magic_terminal']
+    routed[1]['magic_terminal'] = shared
+    routed[1]['all_terminals'] = [shared] + list(routed[1]['qubit_terminals'])
 
 
 def _collect_time_step_results(processor, ready_nodes, node_to_terminals, packing_results, time_step):
@@ -796,15 +807,17 @@ def _retry_failed_with_other_magic(
 
 def _process_time_step_with_harvest(
     processor, dag, ready_nodes, time_step, working_graph,
-    visualize_each_step, ready_terminals=None
+    visualize_each_step, ready_terminals=None, config=None
 ):
     """Process one time step using the HARVEST negotiated-congestion router.
 
     Mirrors ``_process_time_step_with_pathfinder`` but delegates to
     ``LayoutEngine.steiner_packing_harvest`` and attaches the algorithm's
     internal statistics to every result dict under the ``"harvest_stats"``
-    key.
+    key.  With ``config.negotiate`` false the step is a plain greedy Steiner
+    packing (``LayoutEngine.steiner_packing``) instead.
     """
+    config = config or HarvestConfig()
     if not ready_nodes:
         return []
 
@@ -823,16 +836,27 @@ def _process_time_step_with_harvest(
         priorities = [heights[n._node_id] for n in nodes_with_terminals]
 
     logger.info(f"Running HARVEST on {len(terminal_sets)} terminal sets")
-    packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
-        working_graph,
-        terminal_sets,
-        max_iters=4,
-        alpha=2.0,
-        beta=1.5,
-        stagnation_limit=2,
-        greedy_order="min_size",
-        priorities=priorities,
-    )
+    if config.negotiate:
+        packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
+            working_graph,
+            terminal_sets,
+            max_iters=config.max_iters,
+            alpha=config.alpha,
+            beta=config.beta,
+            stagnation_limit=config.stagnation_limit,
+            greedy_order="min_size",
+            greedy_fill=config.greedy_fill,
+            priorities=priorities,
+        )
+    else:
+        packing_results, _ = processor.eng.steiner_packing(
+            working_graph, terminal_sets, greedy_order="min_size"
+        )
+        harvest_stats = {
+            "iterations": 0, "initial_routes": len(terminal_sets), "reroutes": 0,
+            "conflicted_reroutes": 0, "dropped": 0, "filled": 0,
+            "final_conflict_score": 0, "stopped_reason": "no_negotiation",
+        }
     logger.info(
         f"HARVEST step {time_step}: iters={harvest_stats['iterations']}, "
         f"conflicted_reroutes={harvest_stats['conflicted_reroutes']}, "
@@ -844,10 +868,12 @@ def _process_time_step_with_harvest(
         processor, ready_nodes, node_to_terminals, packing_results, time_step
     )
 
-    _retry_failed_with_other_magic(
-        processor, dag, working_graph, time_step_results, ready_terminals,
-        ready_nodes=ready_nodes, time_step=time_step,
-    )
+    if config.magic_retry:
+        _retry_failed_with_other_magic(
+            processor, dag, working_graph, time_step_results, ready_terminals,
+            ready_nodes=ready_nodes, time_step=time_step,
+        )
+    _inject_reuse_terminal(processor, time_step_results)
 
     # Attach HARVEST-specific metadata to every result in this time step.
     for r in time_step_results:
@@ -858,7 +884,21 @@ def _process_time_step_with_harvest(
     return time_step_results
 
 
-def process_dag_with_harvest(processor, dag, visualize_each_step=False):
+def _inject_skip_dep(processor, tracker, ready_nodes):
+    """Fault ``skip_dep``: one product whose predecessors are pending becomes ready."""
+    if ready_nodes is None:
+        return
+    if processor.__dict__.get("_fault_skip_dep_done") or not faults.active("skip_dep"):
+        return
+    # Injected every step until a premature product is actually routed (then
+    # noted as activated); a deferred one later runs legitimately.
+    pending = tracker.blocked()
+    if pending:
+        processor._fault_skip_dep_node = pending[len(pending) // 2]
+        ready_nodes.append(processor._fault_skip_dep_node)
+
+
+def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=None):
     """Process DAG using HARVEST — a Pathfinder-derived negotiated-congestion
     scheduler with two runtime-focused improvements:
 
@@ -878,6 +918,7 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
         processor: DAGProcessor instance.
         dag: The DAGCircuit to process.
         visualize_each_step: Whether to visualise each time step.
+        config: :class:`HarvestConfig`; ``None`` means the defaults.
 
     Returns:
         list: Result dicts for every successfully routed node.  Each dict
@@ -899,14 +940,13 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
     all_op_nodes = list(dag.op_nodes())
     factory = processor.magic_source
     tracker = ReadyTracker(dag, all_op_nodes)
-    processor._terminal_policy = HARVEST_TERMINALS
-    processor._router_priority = HARVEST_ROUTER_PRIORITY
-    heights = None
-    if HARVEST_PRIORITY == "critical_path":
-        heights = tracker.heights()
-    elif HARVEST_PRIORITY != "dag_order":
-        raise ValueError(f"unknown HARVEST_PRIORITY {HARVEST_PRIORITY!r}")
+    config = config or HarvestConfig()
+    processor._terminal_policy = config.terminals
+    processor._router_priority = config.router_priority
+    heights = tracker.heights() if config.priority == "critical_path" else None
     processor._node_heights = heights
+    # One entry per time step (evaluation instrumentation; never read back).
+    step_log = processor._step_log = []
 
     while len(processed_nodes) < len(all_op_nodes):
         logger.info(f"=== Time Step {time_step} ===")
@@ -917,6 +957,8 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
         processor.used_magic_terminals = set()
 
         ready_nodes = tracker.ready()
+        if faults.active("skip_dep"):
+            _inject_skip_dep(processor, tracker, ready_nodes)
 
         if not ready_nodes:
             logger.warning("No ready nodes found, breaking to avoid infinite loop")
@@ -938,6 +980,7 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
         if not executable_nodes:
             if factory:
                 factory.record_wait_cycle()
+            step_log.append({"ready": len(ready_nodes), "executable": 0, "routed": 0})
             idle_streak += 1
             logger.info(
                 f"Time step {time_step}: idle (waiting for magic states, "
@@ -962,8 +1005,24 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
 
         time_step_results = _process_time_step_with_harvest(
             processor, dag, executable_nodes, time_step, working_graph,
-            visualize_each_step, ready_terminals=ready_terminals,
+            visualize_each_step, ready_terminals=ready_terminals, config=config,
         )
+
+        early_consume = faults.active("early_consume")
+        if early_consume and factory and not factory.unlimited:
+            # Fault: every assigned terminal is consumed, routed or not.
+            for result in time_step_results:
+                if result.get('magic_terminal') is not None and node_needs_magic_state(result['node']):
+                    if factory.consume(result['magic_terminal']) and not result['success']:
+                        faults.note("early_consume")
+        skipped = processor.__dict__.get("_fault_skip_dep_node")
+        if skipped is not None:
+            # Only a premature product routed in its injection step violates
+            # anything; if it is deferred it later runs legitimately.
+            if any(r['success'] and r['node'] is skipped for r in time_step_results):
+                faults.note("skip_dep")
+                processor._fault_skip_dep_done = True
+            processor._fault_skip_dep_node = None
 
         successful_nodes = []
         for result in time_step_results:
@@ -972,11 +1031,23 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False):
                 tracker.mark_done(result['node'])
                 all_results.append(result)
                 successful_nodes.append(result['node'])
-                if factory and not factory.unlimited and node_needs_magic_state(result['node']):
+                if (factory and not factory.unlimited and not early_consume
+                        and node_needs_magic_state(result['node'])):
                     factory.consume(result['magic_terminal'])
 
         successful_count = len(successful_nodes)
         failed_count = len(time_step_results) - successful_count
+        step_stats = time_step_results[0]['harvest_stats'] if time_step_results else {}
+        step_log.append({
+            "ready": len(ready_nodes),
+            "executable": len(executable_nodes),
+            "routed": successful_count,
+            "iterations": step_stats.get("iterations", 0),
+            "reroutes": step_stats.get("reroutes", 0),
+            "dropped": step_stats.get("dropped", 0),
+            "filled": step_stats.get("filled", 0),
+            "magic_retries": sum(1 for r in time_step_results if r.get("magic_retry")),
+        })
 
         logger.info(
             f"Time step {time_step}: {successful_count} successful, "

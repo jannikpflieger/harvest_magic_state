@@ -203,9 +203,20 @@ def deterministic_result_name(config: BaselineRunConfig) -> str:
 
 
 def write_result(path: Path, result: BaselineResult, config: BaselineRunConfig) -> None:
-    """Atomically write a raw result with the exact run configuration."""
+    """Atomically write a raw result with the exact run configuration.
+
+    Full routes (``metadata["routes"]``) go to a gzipped sidecar file
+    (``harvest.eval.routes``); the record keeps only its file name.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"config": config.serializable(), "result": result.to_dict()}
+    record = result.to_dict()
+    metadata = record.get("metadata") or {}
+    routes = metadata.pop("routes", None)
+    if routes is not None:
+        from harvest.eval.routes import write_routes
+
+        metadata["routes_file"] = write_routes(path, routes).name
+    payload = {"config": config.serializable(), "result": record}
     encoded = json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(encoded)

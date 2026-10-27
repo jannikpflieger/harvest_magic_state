@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Set, Tuple
 
+from harvest import faults
+
 logger = logging.getLogger("HarvestMagicState.LatticePruner")
 
 # Type aliases matching engine.py conventions
@@ -93,6 +95,13 @@ def prune_lattice(
         # Data-qubit port nodes
         for term in r.get("qubit_terminals", []):
             used_nodes.add(term)
+
+    if faults.active("prune_used"):
+        # Fault: drop one routing tile that a route uses.
+        tiles = sorted(n for n in used_nodes if isinstance(n, tuple))
+        if tiles:
+            faults.note("prune_used")
+            used_nodes.discard(tiles[len(tiles) // 2])
 
     def _is_magic_patch(type_map: Dict[str, List[str]]) -> bool:
         # In this codebase magic patches expose M-ports.

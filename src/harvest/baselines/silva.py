@@ -17,7 +17,7 @@ from harvest.compilation.utils import node_needs_magic_state
 from harvest.routing.scheduler import ReadyTracker
 
 from .base import BaselineAdapter, BaselineResult, BaselineRunConfig
-from .cultivation import cultivation_mean, make_cultivator
+from .cultivation import make_magic_source
 from .metrics import space_time_volume
 
 logger = logging.getLogger("HarvestMagicState.SilvaEAF")
@@ -288,7 +288,14 @@ def validate_silva_ir(dag) -> None:
 
 
 class SilvaEAFAdapter(BaselineAdapter):
-    """In-tree adapter exposing ``silva_eaf`` through the common schema."""
+    """In-tree adapter exposing ``silva_eaf`` through the common schema.
+
+    With ``config.options["prune"]`` the finished schedule is pruned exactly
+    as HARVEST's (``prune_lattice`` + ``processor_patch_count``), which
+    separates a better schedule from better area accounting.  Accepts the
+    same ``validate``/``strict_validate``/``phase_times`` keywords as
+    ``HarvestAdapter``.
+    """
 
     name = "silva"
 
@@ -315,43 +322,78 @@ class SilvaEAFAdapter(BaselineAdapter):
                 notes=["Unsupported operations were not discarded or rewritten."],
             )
 
+        from harvest.eval.instrument import (
+            initial_area, process_peak_rss_mb, retained_area, schedule_stats,
+        )
+        from harvest.eval.routes import route_entries, schedule_entry
         from harvest.routing.processor import DAGProcessor
 
+        from .harvest import ValidationError, processor_patch_count, validate_run, validation_metadata
+
+        prune = bool(config.options.get("prune", False))
+        validate = kwargs.get("validate", True)
         start = perf_counter()
         processor = DAGProcessor(layout_engine=layout_engine)
-        mean = cultivation_mean(config.options)
-        if mean is not None:
-            processor.magic_source = make_cultivator(processor.magic_terminals, mean, config.seed)
+        source = make_magic_source(config.options, processor.magic_terminals, config.seed)
+        mean = None
+        if source is not None:
+            processor.magic_source = source
+            mean = config.options.get("cultivation_mean_cycles", config.options.get("magic_mean_cycles"))
         results = processor.process_entire_dag(dag, mode="silva_eaf")
-        runtime = perf_counter() - start
+        schedule_time = perf_counter() - start
         metadata = dict(getattr(processor, "_scheduling_metadata", {}))
         completed = bool(metadata.get("completed", False))
         length = metadata.get("total_elapsed_steps") if completed else None
-        patches = _logical_patch_count(layout_engine)
+        consumed = source.get_stats()["total_consumed"] if source is not None else None
+        validation_pre = validation_post = None
+        if validate and completed:
+            validation_pre = validate_run(processor, dag, results, config, length, consumed=consumed)
+        unpruned = _logical_patch_count(layout_engine)
+        patches = unpruned
+        pruning_stats = None
+        prune_time = 0.0
+        if prune and completed:
+            prune_started = perf_counter()
+            pruning_stats = processor.prune_after_scheduling(results)
+            patches = processor_patch_count(processor, config.num_qubits)
+            prune_time = perf_counter() - prune_started
+            if validate:
+                validation_post = validate_run(processor, dag, results, config, length,
+                                               consumed=consumed)
+        runtime = schedule_time + prune_time
+        validation = validation_metadata(validation_pre, validation_post)
+        if kwargs.get("strict_validate") and validation["n_violations"]:
+            raise ValidationError(
+                f"{config.circuit}/{config.variant}: {validation['n_violations']} violation(s); "
+                + "; ".join((validation_pre or validation_post or {}).get("messages", [])[:3])
+            )
         wirelength = sum(len(result.get("steiner_edges", ())) for result in results)
-        schedule = [
-            {
-                "gate_name": result.get("gate_name"),
-                "qubits": result.get("qubits", []),
-                "time_step": result.get("time_step"),
-                "candidate_order": result.get("candidate_order"),
-                "magic_terminal": result.get("magic_terminal"),
-                "routing_edges": len(result.get("steiner_edges", ())),
-            }
-            for result in results
-        ]
+        schedule = [schedule_entry(dag, result, candidate_order=result.get("candidate_order"))
+                    for result in results]
+        routes = route_entries(dag, results)
         notes = [
-            "No HARVEST negotiated-congestion optimization or pruning was used.",
+            (
+                "Post-scheduling pruning as in HARVEST (prune_lattice, register qubits kept)."
+                if prune else "No HARVEST negotiated-congestion optimization or pruning was used."
+            ),
             (
                 "Static magic-storage patches are available again each logical timestep."
-                if mean is None
-                else f"Common cultivation model: each storage site waits Exp(mean={mean}) cycles after use."
+                if source is None
+                else f"Magic model {config.options.get('magic_model')} (mean {mean} cycles): "
+                     "each storage site waits for its next state after use."
             ),
             "Stable input ordering replaces the paper's unspecified random candidate draw.",
-            "Peak memory is null because in-process memory instrumentation is not enabled.",
+            "Peak memory is null; metadata.process_peak_rss_mb is the process-wide peak so far.",
         ]
         if not completed:
             notes.append("At least one dependency-ready operation was unroutable.")
+        area = {"initial": initial_area(layout_engine)}
+        if prune and completed:
+            area["pruned"] = retained_area(processor, config.num_qubits)
+        instrumentation = schedule_stats(dag, results, length, len(processor.magic_terminals))
+        instrumentation["steps_idle"] = metadata.get("magic_wait_steps")
+        instrumentation["magic_wait_cycles"] = metadata.get("magic_wait_steps", 0)
+        instrumentation["magic_consumed"] = consumed
         return BaselineResult(
             baseline=config.baseline,
             variant=config.variant,
@@ -360,21 +402,42 @@ class SilvaEAFAdapter(BaselineAdapter):
             input_representation="Pauli-product rotations (±pi/8)",
             comparison_mode=config.comparison_mode,
             schedule_length=length,
-            logical_patches=patches,
+            logical_patches=patches if completed or not prune else None,
             space_time_volume=space_time_volume(patches, length),
             routing_wirelength=wirelength if completed else None,
             compiler_runtime_s=runtime,
             completed=completed,
             trial=config.trial,
-            seed=config.seed if mean is not None else None,
+            seed=config.seed if source is not None else None,
             upstream_version="Silva et al., TQC 2024 (Algorithms 1–2)",
-            command="DAGProcessor.process_entire_dag(mode='silva_eaf')",
+            command="DAGProcessor.process_entire_dag(mode='silva_eaf')"
+                    + (" + prune_after_scheduling" if prune else ""),
             notes=notes,
             error=None if completed else "one or more ready operations were unroutable",
-            initial_logical_patches=patches,
+            initial_logical_patches=unpruned,
+            post_pruning_logical_patches=patches if prune and completed else None,
+            space_time_volume_initial=space_time_volume(unpruned, length),
+            space_time_volume_post_pruning=(
+                space_time_volume(patches, length) if prune and completed else None
+            ),
             metadata={
                 "scheduler": metadata,
                 "schedule": schedule,
-                "space_time_definition": "full_unpruned_layout_patches * schedule_length",
+                "routes": routes,
+                "pruning": pruning_stats,
+                "phase_times_s": {
+                    **dict(kwargs.get("phase_times") or {}),
+                    "t_schedule_s": schedule_time,
+                    "t_prune_s": prune_time,
+                    "t_validate_s": validation["validate_time_s"] or 0.0,
+                },
+                "area": area,
+                "instrumentation": instrumentation,
+                "validation": validation,
+                "process_peak_rss_mb": process_peak_rss_mb(),
+                "space_time_definition": (
+                    "post_pruning_logical_patches * schedule_length" if prune
+                    else "full_unpruned_layout_patches * schedule_length"
+                ),
             },
         )

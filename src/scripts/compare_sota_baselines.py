@@ -55,9 +55,12 @@ from harvest.baselines.puremagic import (
     write_trans_file,
 )
 from harvest.baselines.silva import SilvaEAFAdapter
+from harvest.baselines.cultivation import MAGIC_MODELS, STOCHASTIC_MODELS
+from harvest.eval.manifest import append_run_row, run_row
 from harvest.compilation.circuit_analysis import convert_rx_ry_to_rz, pre_prep_circuit
 from harvest.compilation.pauli_block_conversion import convert_to_PCB, create_dag
 from harvest.compilation.qasm_loader import find_qasm_files, qasm_to_circuit
+from harvest.faults import FAULTS
 from harvest.layout.presets import nxm_ring_layout_single_qubits
 
 logger = logging.getLogger("SOTABaselineComparison")
@@ -67,6 +70,7 @@ DISPLAY = {
     ("harvest", "harvest_circuit_aware"): "HARVEST (circuit-aware placement)",
     ("silva", "silva_eaf"): "Silva EAF",
     ("silva", "silva_eaf_matched_placement"): "Silva EAF (matched placement)",
+    ("silva", "silva_eaf_pruned"): "Silva EAF + pruning",
     ("puremagic", "puremagic_bus"): "PureMagic Bus",
     ("puremagic", "puremagic"): "PureMagic",
     ("dascot", "dascot_square_sparse"): "DASCOT Square Sparse",
@@ -94,6 +98,7 @@ COLORS = {
     "HARVEST (circuit-aware placement)": "#4C72B0",
     "Silva EAF": "#DD8452",
     "Silva EAF (matched placement)": "#DD8452",
+    "Silva EAF + pruning": "#E8A87C",
     "PureMagic Bus": "#55A868",
     "PureMagic": "#C44E52",
     "DASCOT Square Sparse": "#8172B3",
@@ -122,6 +127,7 @@ def discover_benchmarks(spec: str, max_circuits: Optional[int] = None) -> List[P
 
 
 def load_benchmark(path: Path):
+    """Exact Clifford+T QASM -> (circuit, Pauli-product DAG)."""
     circuit = qasm_to_circuit(str(path))
     circuit = pre_prep_circuit(circuit)
     if "rx" in circuit.count_ops() or "ry" in circuit.count_ops():
@@ -341,6 +347,7 @@ def _parse_baselines(value: str) -> List[str]:
         "harvest": "harvest",
         "silva": "silva",
         "silva_eaf": "silva",
+        "silva_pruned": "silva_pruned",
         "puremagic": "puremagic",
         "dascot": "dascot",
         "litinski": "litinski",
@@ -374,6 +381,7 @@ def _config(
     versions = {
         "harvest": _git_commit(),
         "silva": "Silva et al., TQC 2024",
+        "silva_pruned": "Silva et al., TQC 2024 + HARVEST pruning",
         "puremagic": args.puremagic_version,
         "dascot": args.wisq_version,
         "litinski": "Litinski, Quantum 3, 128 (2019)",
@@ -409,24 +417,41 @@ def _magic_options(args) -> Dict[str, Any]:
     """Magic-state model in a config; the free default keeps old configs unchanged."""
     if args.magic_model == "free":
         return {}
-    return {"magic_model": args.magic_model, "cultivation_mean_cycles": args.cultivation_mean_cycles}
+    if args.magic_model == "cultivation":
+        return {"magic_model": "cultivation",
+                "cultivation_mean_cycles": args.cultivation_mean_cycles}
+    return {"magic_model": args.magic_model, "magic_mean_cycles": args.cultivation_mean_cycles}
 
 
 def _model_trials(args) -> List[tuple]:
     """(trial, seed) pairs for in-tree models: one deterministic run, or seeded
-    trials once cultivation makes them stochastic."""
-    if args.magic_model == "free":
+    trials once a stochastic supply model makes them stochastic."""
+    if args.magic_model not in STOCHASTIC_MODELS:
         return [(0, None)]
     return [(t, args.seed + t) for t in range(args.cultivation_trials)]
 
 
 def _layout_options(args) -> Dict[str, Any]:
     """Layout knobs recorded in a config; the default keeps old configs unchanged."""
-    if args.layout_preset == "ring":
-        return {}
-    options: Dict[str, Any] = {"layout_preset": args.layout_preset}
+    options: Dict[str, Any] = {}
+    if args.layout_preset != "ring":
+        options["layout_preset"] = args.layout_preset
     if args.layout_preset in ("fixed_magic", "dense"):
         options["layout_magic_count"] = args.layout_magic_count
+    if args.layout_magic_ring:
+        options["layout_magic_ring"] = args.layout_magic_ring
+    return options
+
+
+def _harvest_options(args) -> Dict[str, Any]:
+    """HARVEST scheduler knobs that differ from the defaults (none: old configs unchanged)."""
+    options: Dict[str, Any] = {}
+    if args.harvest_config:
+        options["harvest_config"] = args.harvest_config
+    if args.harvest_scheduler != "harvest":
+        options["scheduler"] = args.harvest_scheduler
+    if args.fault:
+        options["fault"] = args.fault
     return options
 
 
@@ -485,9 +510,75 @@ def execute_config(
         config.variant,
         config.trial,
     )
-    result = _dry_result(config) if dry_run else adapter.run(config, **kwargs)
+    if dry_run:
+        result = _dry_result(config)
+    else:
+        result = _run_adapter(adapter, config, **kwargs)
     write_result(path, result, config)
+    _record_run(config, result)
+    violations = (result.metadata.get("validation") or {}).get("n_violations")
+    if RUN_CONTEXT.strict_validate and violations:
+        raise SystemExit(
+            f"strict validation: {config.circuit}/{config.variant} has {violations} "
+            f"violation(s); record kept at {path}"
+        )
     return result
+
+
+@dataclass
+class RunContext:
+    """Driver-wide settings for the eval harness (set from the CLI in ``main``)."""
+
+    runs_csv: Optional[Path] = None
+    exp_id: str = ""
+    point: str = ""
+    strict_validate: bool = False
+    in_process_timeout: Optional[float] = None
+
+
+RUN_CONTEXT = RunContext()
+IN_PROCESS = frozenset({"harvest", "silva", "litinski", "o3ls", "lsqca"})
+
+
+def _record_run(config: BaselineRunConfig, result: BaselineResult) -> None:
+    if RUN_CONTEXT.runs_csv is None:
+        return
+    payload = {"config": config.serializable(), "result": result.to_dict()}
+    append_run_row(RUN_CONTEXT.runs_csv, run_row(RUN_CONTEXT.exp_id, RUN_CONTEXT.point, payload))
+
+
+def _run_adapter(adapter, config: BaselineRunConfig, **kwargs: Any) -> BaselineResult:
+    """Run one trial; an exception or in-process timeout becomes a failed record."""
+    import signal
+
+    timeout = RUN_CONTEXT.in_process_timeout if config.baseline in IN_PROCESS else None
+
+    def on_alarm(signum, frame):
+        raise TimeoutError(f"in-process timeout after {timeout} s")
+
+    previous = None
+    if timeout:
+        previous = signal.signal(signal.SIGALRM, on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+    started = perf_counter()
+    try:
+        return adapter.run(config, **kwargs)
+    except TimeoutError as exc:
+        return BaselineResult.failed(
+            config, input_representation="in-process", error=str(exc), timed_out=True,
+            runtime_s=perf_counter() - started,
+        )
+    except Exception as exc:  # recorded as a failed trial, never dropped
+        logger.exception("%s/%s on %s raised", config.baseline, config.variant, config.circuit)
+        return BaselineResult.failed(
+            config, input_representation="in-process",
+            error=f"exception: {type(exc).__name__}: {exc}",
+            runtime_s=perf_counter() - started,
+        )
+    finally:
+        if timeout:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 def _load_raw_results(raw_dir: Path) -> List[Dict[str, Any]]:
@@ -725,9 +816,11 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
     output_dir = Path(args.output_dir)
     raw_dir = output_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    placement_cost = None
     try:
         frontend_started = perf_counter()
         circuit, dag = load_benchmark(path)
+        compose_done = perf_counter()
         layout = build_layout(
             circuit.num_qubits,
             args.rows,
@@ -738,28 +831,57 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             args.layout_preset,
             args.layout_magic_count,
         )
-        harvest_frontend_runtime = perf_counter() - frontend_started
+        if args.layout_magic_ring:
+            from harvest.layout.presets import thin_magic_ring
+
+            layout = thin_magic_ring(layout, args.layout_magic_ring)
+        layout_done = perf_counter()
+        if args.placement in ("index", "random", "circuit_aware_preset"):
+            from harvest.eval.placement import place
+
+            layout, placement_cost, _ = place(
+                layout, dag, args.placement.replace("_preset", ""), seed=args.seed
+            )
+        place_done = perf_counter()
+        harvest_frontend_runtime = place_done - frontend_started
+        phase_times = {
+            "t_compose_s": compose_done - frontend_started,
+            "t_layout_s": layout_done - compose_done,
+            "t_place_s": place_done - layout_done,
+        }
     except Exception as exc:
         logger.error("failed to load %s: %s", path, exc)
         return
 
     circuit_aware = args.placement == "circuit_aware"
+    seeded_placement = args.placement in ("circuit_aware", "random", "circuit_aware_preset")
     deterministic = [
         (
             "harvest",
-            "harvest_circuit_aware" if circuit_aware else "harvest",
+            "harvest",
+            args.harvest_variant or ("harvest_circuit_aware" if circuit_aware else "harvest"),
             HarvestAdapter(),
+            _harvest_options(args),
         ),
         (
             "silva",
+            "silva",
             "silva_eaf_matched_placement" if circuit_aware else "silva_eaf",
             SilvaEAFAdapter(),
+            {},
+        ),
+        (
+            "silva_pruned",
+            "silva",
+            "silva_eaf_pruned",
+            SilvaEAFAdapter(),
+            {"prune": True},
         ),
     ]
-    for (baseline, variant, adapter), (trial, seed) in (
+    for (selector, baseline, variant, adapter, extra), (trial, seed) in (
         (entry, ts) for entry in deterministic for ts in _model_trials(args)
     ):
-        if baseline not in selected:
+        if selector not in selected:
             continue
         config = _config(
             args=args,
@@ -771,11 +893,12 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
             seed=seed,
             options={
                 "placement": args.placement,
-                "placement_seed": args.seed if circuit_aware else None,
+                "placement_seed": args.seed if seeded_placement else None,
                 "requested_rows": args.rows,
                 "requested_cols": args.cols,
                 **_layout_options(args),
                 **_magic_options(args),
+                **extra,
             },
         )
         execute_config(
@@ -791,7 +914,25 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
                 if baseline == "harvest" and args.comparison_mode == "native_end_to_end"
                 else 0.0
             ),
+            phase_times=phase_times,
+            placement_cost=placement_cost,
+            validate=not args.no_validate,
         )
+
+    if args.magic_model not in ("free", "cultivation"):
+        # The matched-IR baselines model only free and cultivated states.
+        for baseline in ("litinski", "o3ls", "puremagic", "lsqca", "taco", "dascot"):
+            if baseline in selected:
+                config = _config(args=args, baseline=baseline, variant=baseline, circuit=path,
+                                 num_qubits=circuit.num_qubits, trial=0, seed=None,
+                                 options=_magic_options(args))
+                result = BaselineResult.failed(
+                    config, input_representation="not materialized",
+                    error=f"unsupported magic model {args.magic_model!r} for {baseline}",
+                )
+                write_result(raw_result_path(raw_dir, config), result, config)
+                _record_run(config, result)
+        return
 
     # Matched-IR reimplementations/models that consume the same Pauli-product DAG.
     for baseline, module, cls in (
@@ -895,6 +1036,7 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
                         ],
                     )
                     write_result(result_path, result, config)
+                    _record_run(config, result)
                 elif conversion_error is not None:
                     result = BaselineResult.failed(
                         config,
@@ -903,6 +1045,7 @@ def run_circuit(path: Path, args: argparse.Namespace, selected: Sequence[str]) -
                         notes=["No unsupported operation was discarded."],
                     )
                     write_result(result_path, result, config)
+                    _record_run(config, result)
                 else:
                     execute_config(
                         PureMagicAdapter(),
@@ -1028,9 +1171,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--cols", type=int)
     parser.add_argument(
         "--placement",
-        choices=["row_major", "circuit_aware"],
+        choices=["row_major", "circuit_aware", "index", "random", "circuit_aware_preset"],
         default="row_major",
-        help="Circuit-aware placement is a separately identified matched-placement experiment.",
+        help="row_major: the preset's own order; circuit_aware: synthesized bus template "
+             "(a separately identified matched-placement experiment); index / random / "
+             "circuit_aware_preset: harvest.eval.placement on the chosen preset "
+             "(same geometry, records the placement cost).",
     )
     parser.add_argument(
         "--layout-preset",
@@ -1040,13 +1186,41 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--layout-magic-count", type=int, default=2,
                         help="Magic patches for --layout-preset fixed_magic.")
+    parser.add_argument("--layout-magic-ring", type=int, default=0,
+                        help="Keep only this many ring magic patches, evenly spread "
+                             "(presets.thin_magic_ring; 0 = the preset's full ring).")
     parser.add_argument(
-        "--magic-model", choices=["free", "cultivation"], default="free",
+        "--magic-model", choices=list(MAGIC_MODELS), default="free",
         help="free: magic states always ready (matched-IR default); cultivation: every "
              "compiler's magic ports cultivate states with Exp(mean) cycles "
-             "(harvest.baselines.cultivation; PureMagic gets lambda = 1/mean).",
+             "(harvest.baselines.cultivation; PureMagic gets lambda = 1/mean); fixed / "
+             "geometric (HARVEST and Silva only): fixed latency / geometric cultivation "
+             "with the given mean.",
     )
-    parser.add_argument("--cultivation-mean-cycles", type=float, default=3.0)
+    parser.add_argument("--cultivation-mean-cycles", type=float, default=3.0,
+                        help="Mean preparation latency of the magic model (cycles).")
+    harvest = parser.add_argument_group("HARVEST scheduler / evaluation harness")
+    harvest.add_argument("--harvest-config", type=json.loads, default=None,
+                         help='HarvestConfig overrides as JSON, e.g. \'{"alpha": 4}\'.')
+    harvest.add_argument("--harvest-variant",
+                         help="Variant name recorded for HARVEST runs (e.g. an ablation label).")
+    harvest.add_argument("--harvest-scheduler", choices=["harvest", "steiner_tree"],
+                         default="harvest",
+                         help="steiner_tree: the sequential one-product-per-step ablation.")
+    harvest.add_argument("--fault", choices=list(FAULTS),
+                         help="Inject a HARVEST_FAULT mutation (validator study only).")
+    harvest.add_argument("--no-validate", action="store_true",
+                         help="Skip the schedule validator for HARVEST/Silva.")
+    harvest.add_argument("--strict-validate", action="store_true",
+                         help="Abort on the first schedule with a validator violation.")
+    harvest.add_argument("--runs-csv", type=Path,
+                         help="Append one metadata row per tool run to this CSV.")
+    harvest.add_argument("--exp-id", default="", help="Experiment id written to --runs-csv.")
+    harvest.add_argument("--point", default="", help="Sweep point id written to --runs-csv.")
+    harvest.add_argument("--in-process-timeout", type=float,
+                         help="Wall-clock limit for in-process compilers (default: none).")
+    harvest.add_argument("--no-derive", action="store_true",
+                         help="Skip summary/plot derivation (the eval harness collects raw/).")
     parser.add_argument("--cultivation-trials", type=int, default=5,
                         help="Seeded trials for HARVEST/Silva/Litinski/O3LS under cultivation.")
     parser.add_argument("--puremagic-bin")
@@ -1093,6 +1267,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.baselines = _parse_baselines(args.baselines)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
+    if args.harvest_config is not None:
+        from harvest.routing.config import HarvestConfig
+
+        try:
+            args.harvest_config = HarvestConfig.from_mapping(args.harvest_config).overrides()
+        except (TypeError, ValueError) as exc:
+            parser.error(f"--harvest-config: {exc}")
     return args
 
 
@@ -1102,6 +1283,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     RESUME_POLICY.force_rerun = frozenset(
         b.strip() for b in args.force_rerun.split(",") if b.strip()
     )
+    RUN_CONTEXT.runs_csv = args.runs_csv
+    RUN_CONTEXT.exp_id = args.exp_id
+    RUN_CONTEXT.point = args.point
+    RUN_CONTEXT.strict_validate = args.strict_validate
+    RUN_CONTEXT.in_process_timeout = args.in_process_timeout
+    if args.fault:
+        os.environ["HARVEST_FAULT"] = args.fault
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s - %(message)s",
@@ -1148,6 +1336,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     for path in circuits:
         run_circuit(path, args, args.baselines)
+    if args.no_derive:
+        logger.info("raw results written to %s", output_dir / "raw")
+        return 0
     derive_outputs(output_dir, args.comparison_mode)
     logger.info("outputs written to %s", output_dir)
     return 0

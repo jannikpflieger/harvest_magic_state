@@ -13,6 +13,7 @@ from .magic_terminal_selection import (
     get_magic_terminals,
     choose_optimal_magic_terminal,
 )
+from harvest import faults
 from .magic_state_factory import MagicStateFactory
 from .scheduler import (
     process_dag_sequential,
@@ -335,6 +336,9 @@ class DAGProcessor:
 
                         best_x_port = self._get_best_oriented_port(patch_name, 'X', magic_terminal)
                         best_z_port = self._get_best_oriented_port(patch_name, 'Z', magic_terminal)
+                        if faults.active("drop_y_port") and best_z_port:
+                            faults.note("drop_y_port")
+                            best_z_port = None
 
                         if best_x_port:
                             terminals.append(best_x_port)
@@ -345,7 +349,7 @@ class DAGProcessor:
                         if best_z_port:
                             terminals.append(best_z_port)
                             detailed_logger.info(f"Added oriented Z terminal {best_z_port} for Y operation on qubit {qubit_index}")
-                        else:
+                        elif not faults.active("drop_y_port"):
                             logger.warning(f"No Z ports available for Y operation on patch {patch_name}")
                     else:
                         best_port = self._get_best_oriented_port(patch_name, port_type, magic_terminal)
@@ -439,7 +443,7 @@ class DAGProcessor:
     # DAG-level processing
     # ------------------------------------------------------------------
 
-    def process_entire_dag(self, dag, visualize_each_step=False, mode="steiner_tree"):
+    def process_entire_dag(self, dag, visualize_each_step=False, mode="steiner_tree", config=None):
         """
         Process the entire DAG, node by node, in topological order.
 
@@ -448,6 +452,8 @@ class DAGProcessor:
             visualize_each_step: Whether to visualize each Steiner solution
             mode: "steiner_tree", "steiner_packing", "steiner_pathfinder",
                 "harvest", or "silva_eaf"
+            config: :class:`~harvest.routing.config.HarvestConfig` for
+                ``mode="harvest"`` (``None``: the defaults); ignored otherwise.
 
         Returns:
             list: Results from processing all nodes
@@ -459,7 +465,7 @@ class DAGProcessor:
         elif mode == "steiner_pathfinder":
             return process_dag_with_pathfinder(self, dag, visualize_each_step)
         elif mode == "harvest":
-            return process_dag_with_harvest(self, dag, visualize_each_step)
+            return process_dag_with_harvest(self, dag, visualize_each_step, config=config)
         elif mode == "silva_eaf":
             # Local import avoids a package-initialization cycle while keeping
             # the paper baseline isolated from HARVEST scheduler code.

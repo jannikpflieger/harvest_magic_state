@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple, Union, Set
 from collections import defaultdict, Counter
 import random
 
+from harvest import faults
+
 Coord = Tuple[int, int]
 Node = Union[Coord, str]
 
@@ -950,6 +952,9 @@ class LayoutEngine:
 
         overfull = current_overfull_nodes()
         dropped = set()
+        if overfull and faults.active("no_defer"):
+            faults.note("no_defer")
+            overfull = set()  # fault: commit conflicting routes
 
         while overfull:
             best_i = None

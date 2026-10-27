@@ -6,7 +6,6 @@ from time import perf_counter
 from typing import Any, Optional
 
 from .base import BaselineAdapter, BaselineResult, BaselineRunConfig
-from .cultivation import cultivation_mean, make_cultivator
 from .metrics import space_time_volume
 
 
@@ -38,7 +37,52 @@ def processor_patch_count(processor, num_qubits: Optional[int] = None) -> int:
     return routing_tiles + retained_patch_tiles
 
 
+class ValidationError(RuntimeError):
+    """A schedule violated a validator rule while strict validation was on."""
+
+
+def validate_run(processor, dag, results, config: BaselineRunConfig, total_steps, *,
+                 consumed=None):
+    """Validator report for one stage (pre/post pruning) of an in-tree run."""
+    from harvest.eval.validate import validate
+
+    from .cultivation import make_magic_source
+
+    return validate(
+        processor, dag, results,
+        make_source=lambda terminals: make_magic_source(config.options, terminals, config.seed),
+        total_steps=total_steps, consumed=consumed,
+    )
+
+
+def validation_metadata(pre, post) -> dict:
+    """Flat validator columns (EVAL_PLAN B.3) from the pre/post-pruning reports."""
+    reports = [r for r in (pre, post) if r is not None]
+    return {
+        "validated_pre": None if pre is None else pre["ok"],
+        "validated_post": None if post is None else post["ok"],
+        "n_violations": sum(r["n_violations"] for r in reports) if reports else None,
+        "first_violation_rule": next(
+            (r["first_violation_rule"] for r in reports if r["first_violation_rule"]), None
+        ),
+        "validate_time_s": sum(r["validate_time_s"] for r in reports) if reports else None,
+        "validation_pre": pre,
+        "validation_post": post,
+    }
+
+
 class HarvestAdapter(BaselineAdapter):
+    """HARVEST through the common schema.
+
+    ``config.options`` may carry ``harvest_config`` (HarvestConfig fields that
+    differ from the defaults), ``scheduler`` (``"steiner_tree"``: the
+    sequential ablation baseline) and a magic model (``magic_model`` plus its
+    mean, see ``harvest.baselines.cultivation``).  Keyword arguments besides
+    ``dag``/``layout_engine``: ``preprocessing_runtime_s``, ``phase_times``
+    (front-end phase timings), ``placement_cost``, ``validate`` (default
+    True) and ``strict_validate`` (raise ``ValidationError`` on a violation).
+    """
+
     name = "harvest"
 
     def run(self, config: BaselineRunConfig, **kwargs: Any) -> BaselineResult:
@@ -48,38 +92,88 @@ class HarvestAdapter(BaselineAdapter):
         if dag is None or layout_engine is None:
             raise ValueError("HarvestAdapter.run requires dag= and layout_engine=")
 
+        from harvest.eval.instrument import (
+            initial_area, process_peak_rss_mb, retained_area, schedule_stats,
+        )
+        from harvest.eval.routes import route_entries, schedule_entry
+        from harvest.routing.config import HarvestConfig
         from harvest.routing.processor import DAGProcessor
 
+        from .cultivation import make_magic_source
+
+        harvest_config = HarvestConfig.from_mapping(config.options.get("harvest_config"))
+        mode = config.options.get("scheduler", "harvest")
+        if mode not in ("harvest", "steiner_tree"):
+            raise ValueError(f"unknown HARVEST scheduler mode {mode!r}")
+        validate = kwargs.get("validate", True)
+
+        from harvest import faults
+
         initial_patches = layout_patch_count(layout_engine)
+        faults.reset_activations()
         started = perf_counter()
         processor = DAGProcessor(layout_engine=layout_engine)
-        mean = cultivation_mean(config.options)
-        if mean is not None:
-            # Common cultivation model: every magic patch cultivates one state
-            # at a time (see harvest.baselines.cultivation).
-            processor.magic_source = make_cultivator(processor.magic_terminals, mean, config.seed)
-        results = processor.process_entire_dag(dag, mode="harvest")
+        source = make_magic_source(config.options, processor.magic_terminals, config.seed)
+        if source is not None:
+            # Every magic patch prepares one state at a time (see
+            # harvest.baselines.cultivation for the supply models).
+            processor.magic_source = source
+        results = processor.process_entire_dag(dag, mode=mode, config=harvest_config)
+        schedule_time = perf_counter() - started
         metadata = dict(getattr(processor, "_scheduling_metadata", {}))
         completed = bool(metadata.get("completed", False))
         length = metadata.get("total_elapsed_steps") if completed else None
+        consumed = source.get_stats()["total_consumed"] if source is not None else None
+
+        validation_pre = validation_post = None
+        validate_time = 0.0
+        if validate and completed:
+            validation_pre = validate_run(processor, dag, results, config, length,
+                                          consumed=consumed)
+            validate_time += validation_pre["validate_time_s"]
+
+        prune_started = perf_counter()
         pruning_stats = processor.prune_after_scheduling(results) if completed else None
         post_patches = (
             processor_patch_count(processor, config.num_qubits) if completed else None
         )
-        scheduler_runtime = perf_counter() - started
+        prune_time = perf_counter() - prune_started
+        if validate and completed:
+            # Pruning never reschedules: the same schedule must still be valid
+            # on the pruned routing graph (and keep its length).
+            validation_post = validate_run(processor, dag, results, config, length,
+                                           consumed=consumed)
+            validate_time += validation_post["validate_time_s"]
+        scheduler_runtime = schedule_time + prune_time
         runtime = preprocessing_runtime + scheduler_runtime
         wirelength = sum(len(result.get("steiner_edges", ())) for result in results)
-        schedule = [
-            {
-                "gate_name": result.get("gate_name"),
-                "qubits": result.get("qubits", []),
-                "time_step": result.get("time_step"),
-                "magic_terminal": result.get("magic_terminal"),
-                "routing_edges": len(result.get("steiner_edges", ())),
-            }
-            for result in results
-            if result.get("success", True)
-        ]
+        schedule = [schedule_entry(dag, result) for result in results
+                    if result.get("success", True)]
+        routes = route_entries(dag, results)
+        phase_times = dict(kwargs.get("phase_times") or {})
+        phase_times.update({
+            "t_schedule_s": schedule_time,
+            "t_prune_s": prune_time,
+            "t_validate_s": validate_time,
+        })
+        area = {"initial": initial_area(layout_engine)}
+        if completed:
+            area["pruned"] = retained_area(processor, config.num_qubits)
+        instrumentation = schedule_stats(
+            dag, results, length, len(processor.magic_terminals),
+            step_log=getattr(processor, "_step_log", None),
+        )
+        instrumentation["magic_wait_cycles"] = (
+            source.get_stats()["total_wait_cycles"] if source is not None else 0
+        )
+        instrumentation["magic_consumed"] = consumed
+        instrumentation["placement_cost"] = kwargs.get("placement_cost")
+        validation = validation_metadata(validation_pre, validation_post)
+        if kwargs.get("strict_validate") and validation["n_violations"]:
+            raise ValidationError(
+                f"{config.circuit}/{config.variant}: {validation['n_violations']} violation(s); "
+                + "; ".join((validation_pre or validation_post or {}).get("messages", [])[:3])
+            )
         return BaselineResult(
             baseline=config.baseline,
             variant=config.variant,
@@ -94,14 +188,15 @@ class HarvestAdapter(BaselineAdapter):
             compiler_runtime_s=runtime,
             completed=completed,
             trial=config.trial,
-            seed=config.seed if mean is not None else None,
+            seed=config.seed if source is not None else None,
             upstream_version=config.upstream_version,
-            command="DAGProcessor.process_entire_dag(mode='harvest')",
+            command=f"DAGProcessor.process_entire_dag(mode={mode!r}, config=HarvestConfig(**"
+                    f"{harvest_config.overrides()!r}))",
             notes=[
                 "Pruning is applied only after scheduling and does not change schedule length.",
                 "Both initial and post-pruning patch counts/space-time values are reported.",
                 "Post-pruning patches keep every register qubit's data patch, even if no product touches it.",
-                "Peak memory is null because in-process memory instrumentation is not enabled.",
+                "Peak memory is null; metadata.process_peak_rss_mb is the process-wide peak so far.",
                 "Runtime includes frontend/layout in native_end_to_end and only scheduling/pruning otherwise.",
             ],
             error=None if completed else "HARVEST did not route every DAG operation",
@@ -112,11 +207,21 @@ class HarvestAdapter(BaselineAdapter):
             metadata={
                 "scheduler": metadata,
                 "schedule": schedule,
+                "routes": routes,
                 "pruning": pruning_stats,
+                "harvest_config": harvest_config.to_dict(),
+                "scheduler_mode": mode,
                 "runtime_breakdown_s": {
                     "frontend_and_layout": preprocessing_runtime,
                     "scheduling_and_pruning": scheduler_runtime,
                 },
+                "phase_times_s": phase_times,
+                "area": area,
+                "instrumentation": instrumentation,
+                "validation": validation,
+                "fault": faults.current(),
+                "fault_activations": faults.activations(),
+                "process_peak_rss_mb": process_peak_rss_mb(),
                 "space_time_definition": {
                     "initial": "initial_logical_patches * schedule_length",
                     "post_pruning": "post_pruning_logical_patches * schedule_length",

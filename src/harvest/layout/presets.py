@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import math
 from typing import Optional, Tuple
 
 from harvest.layout.engine import LayoutEngine, magic_patch_1cell, data_patch_1cell
@@ -429,3 +431,36 @@ def dense_comb_layout(num_qubits: int, num_magic: int = 2, *, swap_xz: bool = Fa
     if bottom_row:
         magic_row(H - 1, num_magic - ports_per_row, "N", "mB")
     return eng
+
+
+def thin_magic_ring(eng: LayoutEngine, keep: int) -> LayoutEngine:
+    """Copy of ``eng`` keeping only ``keep`` magic patches, evenly spaced around the ring.
+
+    Magic patches are ordered along the perimeter (clockwise from the top-left
+    corner) and every ``n/keep``-th one is kept.  The cells of removed magic
+    patches become BLOCKED, so they count neither as routing nor as area:
+    the layout differs from the full ring only in its magic capacity.
+    """
+    magic = [p for p in eng.patches.values() if any(port.port_type == "M" for port in p.ports)]
+    if keep <= 0 or keep >= len(magic):
+        return eng
+    cx, cy = (eng.W - 1) / 2, (eng.H - 1) / 2
+
+    def perimeter_order(patch):
+        x, y = min(patch.cells)
+        return math.atan2(y - cy, x - cx)
+
+    magic.sort(key=perimeter_order)
+    chosen = {magic[int(i * len(magic) / keep)].name for i in range(keep)}
+    magic_names = {p.name for p in magic}
+    out = LayoutEngine(eng.W, eng.H)
+    for cell, value in eng.occ.items():
+        if value == "BLOCKED":
+            out.occ[cell] = "BLOCKED"
+    for patch in eng.patches.values():
+        if patch.name in magic_names and patch.name not in chosen:
+            for cell in patch.cells:
+                out.occ[cell] = "BLOCKED"
+            continue
+        out.add_patch(patch)
+    return out
