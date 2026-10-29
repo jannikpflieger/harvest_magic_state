@@ -73,3 +73,6 @@ routing_experiment_results/**
 /tests/
 /examples/
 /sota_comparison_matched_ir/**
+# Rust router build output (rust/build.sh)
+rust/harvest_router/target/
+src/harvest/_router.so

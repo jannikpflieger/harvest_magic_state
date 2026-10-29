@@ -21,10 +21,12 @@ class HarvestConfig:
     # Also route high-priority products first and, when the congestion loop
     # must drop products, drop the lowest-priority ones.
     router_priority: bool = True
-    # Magic-terminal assignment: "nearest" (greedy per product, Euclidean
-    # distance) or "matching" (one optimal assignment of free terminals to
-    # products minimizing total routing distance).
-    terminals: str = "matching"
+    # Magic-terminal assignment: "route" (the router picks, per product, the
+    # free ready terminal nearest under the step's congestion costs, and may
+    # move it while negotiating), "matching" (one optimal assignment of free
+    # terminals to products by static routing distance, before routing) or
+    # "nearest" (greedy per product, Euclidean distance).
+    terminals: str = "route"
     # False: plain greedy Steiner packing (no negotiated congestion).
     negotiate: bool = True
     max_iters: int = 4
@@ -35,12 +37,22 @@ class HarvestConfig:
     greedy_fill: bool = True
     # Re-route failed products through another free magic terminal.
     magic_retry: bool = True
+    # Admission control: admit a magic product only while a terminal holds a
+    # ready state.  False (ablation): every ready product is assigned a
+    # terminal and routed regardless of supply; a route whose terminal has no
+    # state stalls (is not committed) after occupying routing space that step.
+    admission: bool = True
+    # Router implementation: "rust" (harvest._router, built by rust/build.sh)
+    # or "python" (LayoutEngine); same algorithm, ties may break differently.
+    backend: str = "rust"
 
     def __post_init__(self) -> None:
         if self.priority not in ("critical_path", "dag_order"):
             raise ValueError(f"unknown priority {self.priority!r}")
-        if self.terminals not in ("matching", "nearest"):
+        if self.terminals not in ("route", "matching", "nearest"):
             raise ValueError(f"unknown terminals policy {self.terminals!r}")
+        if self.backend not in ("rust", "python"):
+            raise ValueError(f"unknown backend {self.backend!r}")
         if self.max_iters < 0 or self.stagnation_limit < 1:
             raise ValueError("max_iters must be >= 0 and stagnation_limit >= 1")
 

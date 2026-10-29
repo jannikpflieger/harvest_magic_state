@@ -41,12 +41,40 @@ class Patch:
     cells: Set[Coord]
     ports: List[EdgePort] = field(default_factory=list)
 
+@dataclass(frozen=True, eq=False)
+class TerminalChoice:
+    """First entry of a terminal set whose magic port the router picks.
+
+    The packing routines replace it by the ``candidates`` port nearest to
+    ``targets`` (every node the rest of the set may use) under the current
+    congestion costs, skipping ports another route of the step holds, and
+    complete the set with ``complete(port)`` (the data ports oriented towards
+    it).  Compared with assigning terminals before routing, a product never
+    waits on a terminal it cannot reach while a reachable one is free.
+    ``distances`` (optional, ``{port: {node: distance}}`` on the uncongested
+    graph) answers the uncongested, unblocked case without a search, and
+    ``initial`` (optional) is the port that case takes while it is free (e.g.
+    from a joint assignment of the step's products), instead of the nearest.
+    ``specs`` (``[(patch, [port types])]``) describes the data ports for the
+    Rust router, which orients them itself instead of calling ``complete``.
+    """
+    candidates: Tuple
+    targets: Tuple
+    complete: object  # callable: port -> list of further terminals
+    distances: object = None
+    initial: object = None
+    specs: object = None
+
+
 class LayoutEngine:
     def __init__(self, width: int, height: int):
         self.W = width
         self.H = height
         self.occ: Dict[Coord, str] = {}
         self.patches: Dict[str, Patch] = {}
+        # Set by build_routing_graph: the Manhattan distance between routing
+        # cells is a lower bound on route length (see _astar).
+        self._manhattan_bound = False
 
     # ---- utilities ----
     def in_bounds(self, c: Coord) -> bool:
@@ -151,6 +179,15 @@ class LayoutEngine:
         
         graph, ports_by_patch, pos, patch_used_by_port = self._prune_degree0_nodes(graph, ports_by_patch, pos, patch_used_by_port)
 
+        # A port attached to two routing cells is a zero-cost bridge between
+        # them, so Manhattan distance would overestimate; such layouts (2-tile
+        # patches) keep plain Dijkstra.  Pruned or congestion-weighted copies
+        # of this graph only lose nodes or gain weight, so the bound holds.
+        self._manhattan_bound = all(
+            sum(isinstance(v, tuple) for v, _ in nbrs) <= 1
+            for u, nbrs in graph.items() if isinstance(u, str)
+        )
+
         return graph, ports_by_patch, pos, patch_used_by_port
 
     def _prune_degree0_nodes(self, graph, ports_by_patch, pos, patch_used_by_port):
@@ -245,6 +282,154 @@ class LayoutEngine:
 
         return dist, prev
 
+    def _astar(self, graph, source, targets, goals, node_cost=None, blocked=None):
+        """:meth:`_dijkstra` towards ``targets``, guided by a distance lower bound.
+
+        ``goals`` maps each target to the routing cells through which it is
+        entered (a target cell itself, or the cell a target port attaches to).
+        A route from routing cell ``(x, y)`` crosses at least the Manhattan
+        distance to the nearest open goal in unit-weight cell edges, and at
+        least the distance to the bounding box of the open goals, which is the
+        bound ``h`` used (O(1) per node; port nodes get 0; congestion costs only
+        add).  ``h`` never overestimates, so every target is finalized at its
+        shortest distance, as in ``_dijkstra``; only the order of expansion, and
+        with it the choice among equally short paths, differs.  Once a target
+        is finalized its cells leave the box (still a bound for the open
+        targets) and the queue is re-keyed, so the search heads for the next
+        target instead of circling the found one.  Returns ``(dist, prev)``;
+        ``dist`` is exact for the targets and an upper bound elsewhere.
+        """
+        from heapq import heapify, heappop, heappush
+        INF = 10**18
+        cells = [c for t in targets for c in goals.get(t, ())]
+        if not cells:
+            return self._dijkstra(graph, source, targets, node_cost=node_cost, blocked=blocked)
+        box = [0, 0, 0, 0]
+
+        def set_box(cells):
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            box[:] = min(xs), max(xs), min(ys), max(ys)
+
+        def h(v):
+            if v.__class__ is not tuple:
+                return 0
+            x, y = v
+            x0, x1, y0, y1 = box
+            return ((x0 - x if x < x0 else x - x1 if x > x1 else 0)
+                    + (y0 - y if y < y0 else y - y1 if y > y1 else 0))
+
+        set_box(cells)
+        dist = {source: 0}
+        prev = {}
+        pq = [(h(source), 0, 0, source)]
+        tie = 0
+        remaining = set(targets)
+        dist_get = dist.get
+        graph_get = graph.get
+        cost_get = node_cost.get if node_cost else None
+
+        while pq:
+            _, _, d, u = heappop(pq)
+            if d != dist_get(u, INF):
+                continue
+            if u in remaining:
+                remaining.remove(u)
+                if not remaining:
+                    break
+                left = [c for t in remaining for c in goals.get(t, ())]
+                if not left:  # open targets without an entry cell are unreachable
+                    break
+                if len(left) < len(cells):
+                    cells = left
+                    old = tuple(box)
+                    set_box(cells)
+                    if tuple(box) != old:
+                        pq = [(e[2] + h(e[3]), e[1], e[2], e[3]) for e in pq]
+                        heapify(pq)
+            for v, w in graph_get(u, ()):
+                if blocked is not None and v in blocked:
+                    continue
+                if cost_get is not None:
+                    w = w + cost_get(v, 0.0)
+                nd = d + w
+                if nd < dist_get(v, INF):
+                    dist[v] = nd
+                    prev[v] = u
+                    tie += 1
+                    heappush(pq, (nd + h(v), tie, nd, v))
+
+        return dist, prev
+
+    def _nearest_source(self, graph, sources, targets, node_cost=None, blocked=None):
+        """The source closest to any target.  Raises ``ValueError`` if none reaches one.
+
+        Searched backwards, from all targets at once until the first source is
+        settled: the graph is symmetric and a path is charged the congestion
+        cost of every node on it in either direction, so this is the source a
+        forward search from every source would pick, at the cost of one search
+        around the targets instead of one around each source.
+        """
+        from heapq import heappop, heappush
+        INF = 10**18
+        cost_get = node_cost.get if node_cost else (lambda v, d=0.0: d)
+        sources = set(sources)
+        dist, pq = {}, []
+        for tie, t in enumerate(targets):
+            d0 = cost_get(t, 0.0)
+            if d0 < dist.get(t, INF):
+                dist[t] = d0
+                heappush(pq, (d0, tie, t))
+        tie = len(pq)
+        graph_get = graph.get
+        while pq:
+            d, _, u = heappop(pq)
+            if d != dist.get(u, INF):
+                continue
+            if u in sources:
+                return u
+            for v, w in graph_get(u, ()):
+                if blocked is not None and v in blocked:
+                    continue
+                nd = d + w + cost_get(v, 0.0)
+                if nd < dist.get(v, INF):
+                    dist[v] = nd
+                    tie += 1
+                    heappush(pq, (nd, tie, v))
+        raise ValueError("no free magic terminal reaches the product")
+
+    def _resolve_terminals(self, graph, terminals, taken=(), node_cost=None, blocked=None):
+        """``(terminals, magic)``: a :class:`TerminalChoice` replaced by its port."""
+        if not terminals or not isinstance(terminals[0], TerminalChoice):
+            return terminals, None
+        choice = terminals[0]
+        sources = [c for c in choice.candidates
+                   if c in graph and c not in taken and (blocked is None or c not in blocked)]
+        if not sources:
+            raise ValueError("no free magic terminal left this step")
+        if (choice.initial is not None and choice.initial in sources
+                and not node_cost and not blocked):
+            magic = choice.initial
+        elif choice.distances is not None and not node_cost and not blocked:
+            INF = 10**18
+
+            def static(m):
+                d = choice.distances[m]
+                return min(d.get(t, INF) for t in choice.targets)
+
+            magic = min(sources, key=static)
+            if static(magic) >= INF:
+                raise ValueError("no free magic terminal reaches the product")
+        else:
+            magic = self._nearest_source(graph, sources, choice.targets, node_cost, blocked)
+        return [magic] + list(choice.complete(magic)), magic
+
+    def _goal_cells(self, graph, nodes):
+        """{node: routing cells through which it is entered} for cells or ports."""
+        return {n: ((n,) if isinstance(n, tuple)
+                    else tuple(v for v, _ in graph.get(n, ()) if isinstance(v, tuple)))
+                for n in nodes}
+
     def _reconstruct_path(self, prev, src, dst):
         """Reconstruct src->dst path using a `prev` map from Dijkstra."""
         if src == dst:
@@ -336,7 +521,11 @@ class LayoutEngine:
         prev_from = {}
         tset = set(terminals)
         for s in terminals:
-            d, p = self._dijkstra(graph, s, targets=tset, node_cost=node_cost, blocked=blocked)
+            if self._manhattan_bound:
+                d, p = self._astar(graph, s, tset, self._goal_cells(graph, tset - {s}),
+                                   node_cost=node_cost, blocked=blocked)
+            else:
+                d, p = self._dijkstra(graph, s, targets=tset, node_cost=node_cost, blocked=blocked)
             dist_from[s] = d
             prev_from[s] = p
 
@@ -452,11 +641,15 @@ class LayoutEngine:
             indexed_sets = list(enumerate(terminal_sets))
         
         results = [None] * len(terminal_sets)  # maintain original order
-        
+        taken = set()  # magic ports picked for a TerminalChoice
+
         for orig_idx, terminals in indexed_sets:
             try:
+                terminals, magic = self._resolve_terminals(working_graph, terminals, taken)
                 # Attempt to find Steiner tree with current available edges
                 sol_nodes, sol_edges = self.steiner_tree(working_graph, terminals, prune_cycles=prune_cycles)
+                if magic is not None:
+                    taken.add(magic)
                 
                 # Remove ALL ROUTING NODES used by this tree from the working graph
                 # (terminals/ports can still be used by other trees, but routing cells cannot)
@@ -783,6 +976,7 @@ class LayoutEngine:
         seed: int | None = None,
         greedy_fill: bool = True,
         priorities=None,
+        return_remaining: bool = True,
     ):
         if seed is not None:
             random.seed(seed)
@@ -819,7 +1013,7 @@ class LayoutEngine:
                 indexed.sort(key=lambda x: len(x[1]), reverse=True)
             return indexed
 
-        base_graph = _copy_graph(graph)
+        base_graph = graph  # read-only here; the remaining graph is a copy
         indexed_sets = _order_indices(terminal_sets)
 
         routes = [None] * len(terminal_sets)
@@ -835,13 +1029,21 @@ class LayoutEngine:
 
         # Congestion costs are applied on the fly (``node_cost``) instead of
         # rebuilding a reweighted copy of the graph for every reroute.
+        def _magic_held(skip=None, only=None):
+            # Magic ports picked for TerminalChoice sets by the other routes.
+            return {r["magic"] for j, r in enumerate(routes)
+                    if j != skip and r and r.get("success") and r.get("magic") is not None
+                    and (only is None or j in only)}
+
         for i, terminals in indexed_sets:
             try:
+                concrete, magic = self._resolve_terminals(base_graph, terminals, _magic_held())
                 sol_nodes, sol_edges = self.steiner_tree(
-                    base_graph, terminals, prune_cycles=prune_cycles
+                    base_graph, concrete, prune_cycles=prune_cycles
                 )
                 routes[i] = {
-                    "terminal_set": terminals,
+                    "terminal_set": concrete,
+                    "magic": magic,
                     "sol_nodes": sol_nodes,
                     "sol_edges": sol_edges,
                     "success": True,
@@ -916,14 +1118,19 @@ class LayoutEngine:
                     if h > 0.0:
                         node_cost[n] = node_cost.get(n, 0.0) + beta * h
 
-                # Reroute with updated penalties.
+                # Reroute with updated penalties (a TerminalChoice may move
+                # to another free magic port).
                 try:
+                    concrete, magic = self._resolve_terminals(
+                        base_graph, terminals, _magic_held(skip=i), node_cost=node_cost
+                    )
                     sol_nodes, sol_edges = self.steiner_tree(
-                        base_graph, terminals, prune_cycles=prune_cycles,
+                        base_graph, concrete, prune_cycles=prune_cycles,
                         node_cost=node_cost,
                     )
                     routes[i] = {
-                        "terminal_set": terminals,
+                        "terminal_set": concrete,
+                        "magic": magic,
                         "sol_nodes": sol_nodes,
                         "sol_edges": sol_edges,
                         "success": True,
@@ -1000,32 +1207,38 @@ class LayoutEngine:
         stats_filled = 0
         if greedy_fill:
             committed = set()
+            kept = set()
             for i, terminals in indexed_sets:
                 if routes[i] and routes[i].get("success", False) and i not in dropped:
                     committed |= _routing_nodes_used(routes[i]["sol_nodes"], terminals)
+                    kept.add(i)
             for i, terminals in indexed_sets:
-                if routes[i] and routes[i].get("success", False) and i not in dropped:
+                if i in kept:
                     continue
                 try:
+                    concrete, magic = self._resolve_terminals(
+                        base_graph, terminals, _magic_held(only=kept), blocked=committed
+                    )
                     sol_nodes, sol_edges = self.steiner_tree(
-                        base_graph, terminals, prune_cycles=prune_cycles,
+                        base_graph, concrete, prune_cycles=prune_cycles,
                         blocked=committed,
                     )
                 except (ValueError, KeyError):
                     continue
                 routes[i] = {
-                    "terminal_set": terminals,
+                    "terminal_set": concrete,
+                    "magic": magic,
                     "sol_nodes": sol_nodes,
                     "sol_edges": sol_edges,
                     "success": True,
                 }
+                kept.add(i)
                 dropped.discard(i)
                 committed |= _routing_nodes_used(sol_nodes, terminals)
                 stats_filled += 1
 
         # --- Build outputs and remaining graph (commit packed nets) ----------
 
-        remaining_graph = _copy_graph(base_graph)
         packed_routing_nodes = set()
         results = [None] * len(terminal_sets)
 
@@ -1044,7 +1257,7 @@ class LayoutEngine:
                 rnodes = _routing_nodes_used(r["sol_nodes"], terminals)
                 packed_routing_nodes |= rnodes
                 results[i] = {
-                    "terminal_set": terminals,
+                    "terminal_set": r["terminal_set"],
                     "sol_nodes": r["sol_nodes"],
                     "sol_edges": r["sol_edges"],
                     "success": True,
@@ -1055,21 +1268,20 @@ class LayoutEngine:
                     "dropped due to congestion" if i in dropped else "unrouted",
                 )
                 results[i] = {
-                    "terminal_set": terminals,
+                    # a dropped route keeps the magic port it had picked
+                    "terminal_set": r.get("terminal_set", terminals),
                     "sol_nodes": set(),
                     "sol_edges": set(),
                     "success": False,
                     "error": err,
                 }
 
-        for n in packed_routing_nodes:
-            if n in remaining_graph:
-                del remaining_graph[n]
-        for u in list(remaining_graph.keys()):
-            remaining_graph[u] = [
-                (v, w) for (v, w) in remaining_graph[u]
-                if v not in packed_routing_nodes
-            ]
+        remaining_graph = None
+        if return_remaining:
+            remaining_graph = {
+                u: [(v, w) for (v, w) in nbrs if v not in packed_routing_nodes]
+                for u, nbrs in base_graph.items() if u not in packed_routing_nodes
+            }
 
         stats = {
             "iterations": stats_iterations,

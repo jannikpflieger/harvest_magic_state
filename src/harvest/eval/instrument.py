@@ -102,6 +102,7 @@ def schedule_stats(
             "dropped_total": sum(s.get("dropped", 0) for s in step_log),
             "filled_total": sum(s.get("filled", 0) for s in step_log),
             "magic_retries_total": sum(s.get("magic_retries", 0) for s in step_log),
+            "stalled_total": sum(s.get("stalled", 0) for s in step_log),
             "deferrals_total": sum(deferrals),
             "mean_deferrals_per_step": (sum(deferrals) / len(deferrals)) if deferrals else 0.0,
         })

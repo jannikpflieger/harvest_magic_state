@@ -6,6 +6,7 @@ import logging
 
 from harvest import faults
 from harvest.compilation.utils import node_needs_magic_state
+from harvest.layout.engine import TerminalChoice
 from .config import HarvestConfig
 
 logger = logging.getLogger('HarvestMagicState.DAGProcessor')
@@ -262,6 +263,17 @@ def process_dag_with_packing(processor, dag, visualize_each_step=False):
 
         logger.info(f"Time step {time_step}: {successful_count} successful, {failed_count} failed")
 
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
         if successful_count == 0:
             logger.warning(f"No progress in time step {time_step}, remaining nodes cannot be routed")
             break
@@ -359,6 +371,17 @@ def process_dag_with_pathfinder(processor, dag, visualize_each_step=False):
         failed_count = len(time_step_results) - successful_count
 
         logger.info(f"Time step {time_step}: {successful_count} successful, {failed_count} failed")
+
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
 
         if successful_count == 0:
             logger.warning(f"No progress in time step {time_step}, remaining nodes cannot be routed")
@@ -518,6 +541,40 @@ def _prepare_terminal_sets(processor, dag, ready_nodes, ready_terminals=None):
     # next step, exactly as in Silva's EAF baseline.
     ready_set = set(ready_terminals) if ready_terminals is not None else None
 
+    if getattr(processor, '_terminal_policy', 'nearest') == 'route':
+        available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
+        if ready_set is not None:
+            available_magic = [t for t in available_magic if t in ready_set]
+        if not available_magic:
+            return terminal_sets, node_to_terminals
+        candidates = tuple(available_magic)
+        rust = getattr(processor, '_backend', 'python') == 'rust'
+        # The first routing pass starts from the min-cost matching; the router
+        # may move a product to another free terminal while negotiating.  The
+        # Rust router computes the matching itself (``match_initial``).
+        initial = {} if rust else {
+            node: t for node, t, _ in
+            _assign_terminals_matching(processor, dag, ready_nodes, available_magic)}
+        # Every ready product gets a choice, also beyond the number of free
+        # terminals: one that finds every terminal held fails at once, and the
+        # greedy fill hands it a terminal a failed product left unused.
+        for node in ready_nodes:
+            specs = _port_specs(processor, dag, node)
+            targets = tuple(port for patch, types in specs for t in types
+                            for port in processor.ports_by_patch[patch].get(t, ()))
+            if not targets:
+                continue
+            choice = TerminalChoice(
+                candidates, targets,
+                lambda magic, specs=specs: _oriented_terminals(processor, specs, magic),
+                distances=None if rust else _magic_distances(processor),
+                initial=initial.get(node),
+                specs=specs,
+            )
+            terminal_sets.append([choice])
+            node_to_terminals[node] = {'choice': True}
+        return terminal_sets, node_to_terminals
+
     if getattr(processor, '_terminal_policy', 'nearest') == 'matching':
         available_magic = [t for t in processor.magic_terminals if t not in temp_used_magic]
         if ready_set is not None:
@@ -594,6 +651,17 @@ def _collect_time_step_results(processor, ready_nodes, node_to_terminals, packin
     for i, (node, packing_result) in enumerate(zip(nodes_with_terminals, packing_results)):
         from qiskit.dagcircuit import DAGOpNode
         node_terminals = node_to_terminals[node]
+        if node_terminals.get('choice'):
+            # The router picked the magic port (a dropped product keeps the one
+            # it had picked; a product that never got one holds none).
+            chosen = packing_result['terminal_set']
+            if not chosen or isinstance(chosen[0], TerminalChoice):
+                chosen = []
+            node_terminals = {
+                'magic_terminal': chosen[0] if chosen else None,
+                'qubit_terminals': list(chosen[1:]),
+                'all_terminals': list(chosen),
+            }
 
         result = {
             'node': node,
@@ -770,8 +838,9 @@ def _retry_failed_with_other_magic(
                 return 0.0
             return min(abs(p[0] - a[0]) + abs(p[1] - a[1]) for a in anchor)
 
+        specs = _port_specs(processor, dag, node)
         for magic in sorted(candidates, key=distance):
-            qubit_terminals = processor._get_qubit_terminals_with_magic_direction(dag, node, magic)
+            qubit_terminals = _oriented_terminals(processor, specs, magic)
             if not qubit_terminals:
                 continue
             terminals = [magic] + qubit_terminals
@@ -836,7 +905,30 @@ def _process_time_step_with_harvest(
         priorities = [heights[n._node_id] for n in nodes_with_terminals]
 
     logger.info(f"Running HARVEST on {len(terminal_sets)} terminal sets")
-    if config.negotiate:
+    if config.backend == "rust":
+        from .rust_backend import RustRouter
+
+        router = RustRouter.of(processor)
+        match_initial = config.terminals == "route"
+        if config.negotiate:
+            packing_results, harvest_stats = router.pack_harvest(
+                terminal_sets,
+                max_iters=config.max_iters,
+                alpha=config.alpha,
+                beta=config.beta,
+                stagnation_limit=config.stagnation_limit,
+                greedy_fill=config.greedy_fill,
+                priorities=priorities,
+                match_initial=match_initial,
+            )
+        else:
+            packing_results = router.pack_greedy(terminal_sets, match_initial=match_initial)
+            harvest_stats = {
+                "iterations": 0, "initial_routes": len(terminal_sets), "reroutes": 0,
+                "conflicted_reroutes": 0, "dropped": 0, "filled": 0,
+                "final_conflict_score": 0, "stopped_reason": "no_negotiation",
+            }
+    elif config.negotiate:
         packing_results, _, harvest_stats = processor.eng.steiner_packing_harvest(
             working_graph,
             terminal_sets,
@@ -847,6 +939,7 @@ def _process_time_step_with_harvest(
             greedy_order="min_size",
             greedy_fill=config.greedy_fill,
             priorities=priorities,
+            return_remaining=False,
         )
     else:
         packing_results, _ = processor.eng.steiner_packing(
@@ -868,7 +961,9 @@ def _process_time_step_with_harvest(
         processor, ready_nodes, node_to_terminals, packing_results, time_step
     )
 
-    if config.magic_retry:
+    # With terminals="route" the router (and its greedy fill) already tried
+    # every free terminal, which is what the retry pass adds to "matching".
+    if config.magic_retry and config.terminals != "route":
         _retry_failed_with_other_magic(
             processor, dag, working_graph, time_step_results, ready_terminals,
             ready_nodes=ready_nodes, time_step=time_step,
@@ -943,6 +1038,7 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
     config = config or HarvestConfig()
     processor._terminal_policy = config.terminals
     processor._router_priority = config.router_priority
+    processor._backend = config.backend
     heights = tracker.heights() if config.priority == "critical_path" else None
     processor._node_heights = heights
     # One entry per time step (evaluation instrumentation; never read back).
@@ -973,9 +1069,13 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
             else None
         )
 
-        executable_nodes = _filter_by_magic_availability(
-            ready_nodes, factory, ready_terminals
-        )
+        admission = config.admission or not factory or factory.unlimited
+        if admission:
+            executable_nodes = _filter_by_magic_availability(
+                ready_nodes, factory, ready_terminals
+            )
+        else:
+            executable_nodes = list(ready_nodes)
 
         if not executable_nodes:
             if factory:
@@ -1005,8 +1105,20 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
 
         time_step_results = _process_time_step_with_harvest(
             processor, dag, executable_nodes, time_step, working_graph,
-            visualize_each_step, ready_terminals=ready_terminals, config=config,
+            visualize_each_step, ready_terminals=ready_terminals if admission else None,
+            config=config,
         )
+        stalled = 0
+        if not admission:
+            # Without admission control a product routed to a terminal that
+            # holds no state cannot execute: its route is discarded (stall).
+            ready_set = set(ready_terminals or ())
+            for result in time_step_results:
+                if (result['success'] and node_needs_magic_state(result['node'])
+                        and result['magic_terminal'] not in ready_set):
+                    result['success'] = False
+                    result['stalled'] = True
+                    stalled += 1
 
         early_consume = faults.active("early_consume")
         if early_consume and factory and not factory.unlimited:
@@ -1047,12 +1159,24 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
             "dropped": step_stats.get("dropped", 0),
             "filled": step_stats.get("filled", 0),
             "magic_retries": sum(1 for r in time_step_results if r.get("magic_retry")),
+            "stalled": stalled,
         })
 
         logger.info(
             f"Time step {time_step}: {successful_count} successful, "
             f"{failed_count} failed"
         )
+
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
 
         if successful_count == 0:
             logger.warning(
