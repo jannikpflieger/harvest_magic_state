@@ -35,6 +35,11 @@ class HarvestConfig:
     greedy_fill: bool = True
     # Re-route failed products through another free magic terminal.
     magic_retry: bool = True
+    # Admission control: admit a magic product only while a terminal holds a
+    # ready state.  False (ablation): every ready product is assigned a
+    # terminal and routed regardless of supply; a route whose terminal has no
+    # state stalls (is not committed) after occupying routing space that step.
+    admission: bool = True
 
     def __post_init__(self) -> None:
         if self.priority not in ("critical_path", "dag_order"):

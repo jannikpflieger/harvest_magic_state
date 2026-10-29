@@ -57,8 +57,10 @@ def make_cultivator(terminals: List[Any], mean: float, seed: Optional[int]):
 
 FIXED = "fixed"          # distillation-like: every port is busy exactly mu cycles after use
 GEOMETRIC = "geometric"  # cultivation with per-cycle success 1/mu (mean mu cycles)
-MAGIC_MODELS = (FREE, CULTIVATION, FIXED, GEOMETRIC)
-STOCHASTIC_MODELS = (CULTIVATION, GEOMETRIC)
+MULTIPLEXED = "multiplexed"  # several cultivation units per port feeding a state buffer
+LOGNORMAL = "lognormal"  # cultivation with a heavy-tailed log-normal latency (std = mean)
+MAGIC_MODELS = (FREE, CULTIVATION, FIXED, GEOMETRIC, MULTIPLEXED, LOGNORMAL)
+STOCHASTIC_MODELS = (CULTIVATION, GEOMETRIC, MULTIPLEXED, LOGNORMAL)
 
 
 def magic_mean(options: Mapping[str, Any]) -> Optional[float]:
@@ -92,6 +94,19 @@ def make_magic_source(options: Mapping[str, Any], terminals: List[Any], seed: Op
         from harvest.routing.magic_state_factory import MagicStateFactory
 
         return MagicStateFactory(list(terminals), int(mean))
+    if model == MULTIPLEXED:
+        from harvest.routing.magic_state_multiplexed import MultiplexedCultivator
+
+        return MultiplexedCultivator(
+            list(terminals), mean, units=int(options.get("magic_units", 2)),
+            capacity=int(options.get("magic_capacity", 1)), seed=0 if seed is None else int(seed),
+        )
+    if model == LOGNORMAL:
+        from harvest.routing.magic_state_cultivator import MagicStateCultivator, lognormal_sampler
+
+        return MagicStateCultivator(
+            list(terminals), lognormal_sampler(mean, mean), seed=0 if seed is None else int(seed)
+        )
     from harvest.routing.magic_state_cultivator import MagicStateCultivator, geometric_sampler
 
     return MagicStateCultivator(

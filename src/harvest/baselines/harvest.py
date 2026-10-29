@@ -80,7 +80,8 @@ class HarvestAdapter(BaselineAdapter):
     mean, see ``harvest.baselines.cultivation``).  Keyword arguments besides
     ``dag``/``layout_engine``: ``preprocessing_runtime_s``, ``phase_times``
     (front-end phase timings), ``placement_cost``, ``validate`` (default
-    True) and ``strict_validate`` (raise ``ValidationError`` on a violation).
+    True), ``strict_validate`` (raise ``ValidationError`` on a violation) and
+    ``sink`` (a dict that receives the processor, results and magic source).
     """
 
     name = "harvest"
@@ -169,6 +170,11 @@ class HarvestAdapter(BaselineAdapter):
         instrumentation["magic_consumed"] = consumed
         instrumentation["placement_cost"] = kwargs.get("placement_cost")
         validation = validation_metadata(validation_pre, validation_post)
+        sink = kwargs.get("sink")
+        if sink is not None:
+            # Callers that post-process the schedule (replay, re-scheduling on
+            # the pruned footprint) get the pruned processor and the results.
+            sink.update(processor=processor, results=results, source=source)
         if kwargs.get("strict_validate") and validation["n_violations"]:
             raise ValidationError(
                 f"{config.circuit}/{config.variant}: {validation['n_violations']} violation(s); "

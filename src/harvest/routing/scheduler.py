@@ -262,6 +262,17 @@ def process_dag_with_packing(processor, dag, visualize_each_step=False):
 
         logger.info(f"Time step {time_step}: {successful_count} successful, {failed_count} failed")
 
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
+
         if successful_count == 0:
             logger.warning(f"No progress in time step {time_step}, remaining nodes cannot be routed")
             break
@@ -359,6 +370,17 @@ def process_dag_with_pathfinder(processor, dag, visualize_each_step=False):
         failed_count = len(time_step_results) - successful_count
 
         logger.info(f"Time step {time_step}: {successful_count} successful, {failed_count} failed")
+
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
 
         if successful_count == 0:
             logger.warning(f"No progress in time step {time_step}, remaining nodes cannot be routed")
@@ -973,9 +995,13 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
             else None
         )
 
-        executable_nodes = _filter_by_magic_availability(
-            ready_nodes, factory, ready_terminals
-        )
+        admission = config.admission or not factory or factory.unlimited
+        if admission:
+            executable_nodes = _filter_by_magic_availability(
+                ready_nodes, factory, ready_terminals
+            )
+        else:
+            executable_nodes = list(ready_nodes)
 
         if not executable_nodes:
             if factory:
@@ -1005,8 +1031,20 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
 
         time_step_results = _process_time_step_with_harvest(
             processor, dag, executable_nodes, time_step, working_graph,
-            visualize_each_step, ready_terminals=ready_terminals, config=config,
+            visualize_each_step, ready_terminals=ready_terminals if admission else None,
+            config=config,
         )
+        stalled = 0
+        if not admission:
+            # Without admission control a product routed to a terminal that
+            # holds no state cannot execute: its route is discarded (stall).
+            ready_set = set(ready_terminals or ())
+            for result in time_step_results:
+                if (result['success'] and node_needs_magic_state(result['node'])
+                        and result['magic_terminal'] not in ready_set):
+                    result['success'] = False
+                    result['stalled'] = True
+                    stalled += 1
 
         early_consume = faults.active("early_consume")
         if early_consume and factory and not factory.unlimited:
@@ -1047,12 +1085,24 @@ def process_dag_with_harvest(processor, dag, visualize_each_step=False, config=N
             "dropped": step_stats.get("dropped", 0),
             "filled": step_stats.get("filled", 0),
             "magic_retries": sum(1 for r in time_step_results if r.get("magic_retry")),
+            "stalled": stalled,
         })
 
         logger.info(
             f"Time step {time_step}: {successful_count} successful, "
             f"{failed_count} failed"
         )
+
+        if successful_count == 0 and stalled:
+            # Every routed product stalled on an empty terminal: wait a cycle.
+            if factory:
+                factory.record_wait_cycle()
+            idle_streak += 1
+            if idle_streak > _MAX_IDLE_CYCLES:
+                logger.error("Maximum idle cycles exceeded — aborting.")
+                break
+            time_step += 1
+            continue
 
         if successful_count == 0:
             logger.warning(
