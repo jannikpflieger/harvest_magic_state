@@ -72,6 +72,7 @@ routing_experiment_results/**
 # Local validation and generated example artifacts.
 /tests/
 /examples/
+/eval/
 /sota_comparison_matched_ir/**
 # Rust router build output (rust/build.sh)
 rust/harvest_router/target/

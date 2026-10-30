@@ -47,6 +47,9 @@ pub struct Params {
     pub no_defer: bool,
     pub match_initial: bool,
     pub greedy_order: String,
+    /// Reuse cost per node (``harvest2``): added to every routing cost so
+    /// routes prefer tiles earlier steps already use.  ``None``: plain HARVEST.
+    pub base: Option<Vec<f64>>,
 }
 
 pub struct SetResult {
@@ -317,7 +320,7 @@ impl Core {
     /// Starting magic port per choice set: the min-cost matching of the first
     /// ``len(candidates)`` choice sets with options to the candidates, by
     /// uncongested distance (``scheduler._assign_terminals_matching``).
-    fn match_initial(&mut self, sets: &[SetSpec]) -> Vec<Option<u32>> {
+    fn match_initial(&mut self, sets: &[SetSpec], base: Option<&[f64]>) -> Vec<Option<u32>> {
         let mut initial: Vec<Option<u32>> = sets
             .iter()
             .map(|s| match s {
@@ -352,10 +355,11 @@ impl Core {
                 } else {
                     let d = self.distances(t);
                     has.push(true);
-                    costs.push(qts.iter().map(|&p| {
+                    let reach: f64 = qts.iter().map(|&p| {
                         let x = d[p as usize];
                         if x >= INF { unreachable } else { x }
-                    }).sum());
+                    }).sum();
+                    costs.push(reach + base.map_or(0.0, |b| b[t as usize]));
                 }
             }
             if has.iter().any(|&h| h) {
@@ -380,7 +384,7 @@ impl Core {
         let mut stats = Stats { stopped_reason: "max_iters".into(), ..Default::default() };
         let order = self.order(sets, &p.priorities, &p.greedy_order);
         let initial: Vec<Option<u32>> = if p.match_initial {
-            self.match_initial(sets)
+            self.match_initial(sets, p.base.as_deref())
         } else {
             sets.iter().map(|s| match s {
                 SetSpec::Choice { initial, .. } => *initial,
@@ -402,11 +406,15 @@ impl Core {
                 .collect::<HashSet<u32>>()
         };
 
+        let base = p.base.as_deref();
+        let base_cost = |v: u32| base.map_or(0.0, |b| b[v as usize]);
+        let base_ref: Option<&dyn Fn(u32) -> f64> = if base.is_some() { Some(&base_cost) } else { None };
+
         // --- initial routes ---
         for &i in &order {
             let taken = held(&routes, None, None);
             let route = match self.resolve(&sets[i], initial[i], &taken, None, None) {
-                Ok((concrete, magic)) => match self.tree(&concrete, None, None) {
+                Ok((concrete, magic)) => match self.tree(&concrete, base_ref, None) {
                     Ok(t) => {
                         let rnodes = self.routing_cells(&t.nodes, &sets[i]);
                         for &v in &rnodes {
@@ -466,12 +474,13 @@ impl Core {
                     usage[v as usize] -= 1;
                 }
                 let taken = held(&routes, Some(i), None);
-                let has_cost = touched.iter().any(|&v| usage[v as usize] > 0 || hist[v as usize] > 0.0);
+                let has_cost = base.is_some()
+                    || touched.iter().any(|&v| usage[v as usize] > 0 || hist[v as usize] > 0.0);
                 let result = {
                     let (u, h, alpha, beta, capf) = (&usage, &hist, p.alpha, p.beta, cap as f64);
                     let cost = move |v: u32| {
                         let (c, hv) = (u[v as usize], h[v as usize]);
-                        let mut x = 0.0;
+                        let mut x = base_cost(v);
                         if c > 0 {
                             x += alpha * (c as f64 / capf);
                         }
@@ -581,8 +590,8 @@ impl Core {
                     let blocked = move |v: u32| c[v as usize];
                     let blocked_ref: Option<&dyn Fn(u32) -> bool> =
                         if n_committed > 0 { Some(&blocked) } else { None };
-                    match self.resolve(&sets[i], initial[i], &taken, None, blocked_ref) {
-                        Ok((concrete, magic)) => self.tree(&concrete, None, blocked_ref).map(|t| (concrete, magic, t)),
+                    match self.resolve(&sets[i], initial[i], &taken, base_ref, blocked_ref) {
+                        Ok((concrete, magic)) => self.tree(&concrete, base_ref, blocked_ref).map(|t| (concrete, magic, t)),
                         Err(e) => Err(e),
                     }
                 };
@@ -628,7 +637,7 @@ impl Core {
         let n = self.g.len();
         let order = self.order(sets, &None, greedy_order);
         let initial: Vec<Option<u32>> = if match_initial {
-            self.match_initial(sets)
+            self.match_initial(sets, None)
         } else {
             sets.iter().map(|s| match s {
                 SetSpec::Choice { initial, .. } => *initial,

@@ -21,6 +21,7 @@ Outputs (``results/rq/rq1/``):
                               one line per compiler (+ _by_family_<model>)
   fig2a_volume_decomposition.pdf  area / bound and makespan / critical path per compiler
   fig1_geomean_bars.pdf       geomean time steps, space and volume per compiler
+  families/fig1_bars_<family>.pdf  the same per family (Ising split at 100 qubits)
   fig1_by_size_<model>.pdf    time steps, space and volume / Harvest per circuit, by size
 
 Figures use the circuits every compiler finished, so each bar averages the same set.
@@ -419,32 +420,85 @@ METRICS = [("T", "time steps"), ("area", "space [tiles]"), ("volume", "volume [t
 MARKERS = {"Harvest": "o", "EAF": "s", "PureMagic": "^", "Litinski": "D", "O3LS": "v"}
 
 
-def fig_geomean_bars(best: pd.DataFrame) -> None:
-    """Geomean time steps, space and volume per compiler over the circuits all finished."""
+def bar_group(fam: str, qubits: int, counts: pd.Series) -> str:
+    """Family for the per-family bars: Ising split by size, single circuits as "other"."""
+    if fam == "ising":
+        return "ising (< 100 qubits)" if qubits < 100 else "ising (>= 400 qubits)"
+    return fam if counts.get(fam, 0) >= 2 else "other"
+
+
+def bar_rows(best: pd.DataFrame, model: str, circuits) -> tuple[pd.DataFrame, dict]:
+    """Rows for one bar chart: the circuits every shown compiler finished.
+
+    A compiler is shown if it finished at least half of ``circuits`` (those
+    Harvest finished); the others get an empty bar labelled with their count,
+    so one missing compiler does not shrink the set the others are averaged on.
+    """
+    sub = best[(best.model == model) & best.circuit.isin(circuits) & best.volume.notna()]
+    n = sub[sub.compiler == "Harvest"].circuit.nunique()
+    done = sub.groupby("compiler").circuit.nunique().reindex(COMPILERS, fill_value=0)
+    shown = [c for c in COMPILERS if c == "Harvest" or done[c] * 2 >= n]
+    sub = sub[sub.compiler.isin(shown)]
+    k = sub.groupby("circuit").compiler.nunique()
+    sub = sub[sub.circuit.isin(k[k == len(shown)].index)]
+    return sub, {c: (int(done[c]), n) for c in COMPILERS if c not in shown}
+
+
+def bar_figure(best: pd.DataFrame, circuits, title: str, path) -> None:
+    """Geomean time steps, space and volume per compiler: one row per magic-state model."""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(len(MODELS), len(METRICS), figsize=(11, 3.4 * len(MODELS)))
+    fig, axes = plt.subplots(len(MODELS), len(METRICS), figsize=(11, 3.4 * len(MODELS)), squeeze=False)
     for row, model in zip(axes, MODELS):
-        sub = common(best, model)
+        sub, missing = bar_rows(best, model, circuits)
         n = sub.circuit.nunique()
         ref = {col: geomean(sub[sub.compiler == "Harvest"][col]) for col, _ in METRICS}
         for ax, (col, label) in zip(row, METRICS):
-            vals = [geomean(sub[sub.compiler == c][col]) for c in COMPILERS]
+            vals = [geomean(sub[sub.compiler == c][col]) if c not in missing else np.nan for c in COMPILERS]
             x = np.arange(len(COMPILERS))
-            ax.bar(x, vals, 0.7, color=[style.COMPILER_COLORS[c] for c in COMPILERS],
+            ax.bar(x, [v if v == v else 0 for v in vals], 0.7, color=[style.COMPILER_COLORS[c] for c in COMPILERS],
                    edgecolor=style.SURFACE, linewidth=2)
-            top = max(v for v in vals if v == v)
-            for xi, v in zip(x, vals):
+            shown = [v for v in vals if v == v] or [1]
+            top, low = max(shown), min(shown)
+            log = top > 10 * low  # e.g. large Ising: Litinski/O3LS 20-90x Harvest
+            if log:
+                ax.set_yscale("log")
+            above = (lambda v: v * 1.15) if log else (lambda v: v + 0.02 * top)
+            for xi, c, v in zip(x, COMPILERS, vals):
                 if v == v:
-                    ax.text(xi, v + 0.02 * top, f"{v:,.0f}\n{v / ref[col]:.2f}×",
+                    ax.text(xi, above(v), f"{v:,.0f}\n{v / ref[col]:.2f}×",
                             ha="center", va="bottom", fontsize=7.5, color=style.INK2)
-            ax.set_ylim(0, top * 1.22)
+                else:
+                    done, total = missing.get(c, (0, 0))
+                    ax.text(xi, low * 0.6 if log else 0.02 * top, f"{done}/{total}\ndone",
+                            ha="center", va="bottom", fontsize=7, color=style.MUTED)
+            ax.set_ylim((low * 0.5, top * 6) if log else (0, top * 1.22))
+            if not log:
+                ax.yaxis.set_major_formatter(lambda v, _: f"{v:,.0f}")
             ax.set_xticks(x)
             ax.set_xticklabels(COMPILERS, rotation=30, ha="right", fontsize=8)
             ax.set_title(f"{label}\n{model} magic states, {n} circuits", fontsize=9)
             ax.grid(axis="x", visible=False)
         row[0].set_ylabel("geomean over circuits\n(label: value, ratio to Harvest)")
-    style.save(fig, OUT / "fig1_geomean_bars")
+    fig.suptitle(title, fontsize=10)
+    style.save(fig, path)
+
+
+def fig_geomean_bars(best: pd.DataFrame) -> None:
+    """Geomean time steps, space and volume per compiler over all circuits."""
+    bar_figure(best, best.circuit.unique(), "All circuits", OUT / "fig1_geomean_bars")
+
+
+def fig_family_bars(best: pd.DataFrame) -> None:
+    """``fig1_geomean_bars`` per circuit family (``families/``); Ising split at 100 qubits."""
+    h = best[best.compiler == "Harvest"].drop_duplicates("circuit")
+    counts = h.family.value_counts()
+    groups = {c: bar_group(f, int(q), counts) for c, f, q in zip(h.circuit, h.family, h.num_qubits)}
+    (OUT / "families").mkdir(exist_ok=True)
+    for g in sorted(set(groups.values())):
+        circuits = [c for c, gg in groups.items() if gg == g]
+        name = g.replace(" ", "").replace("(", "_").replace(")", "").replace("<", "lt").replace(">=", "ge")
+        bar_figure(best, circuits, f"{g}: {len(circuits)} circuits", OUT / "families" / f"fig1_bars_{name}")
 
 
 def fig_by_size(best: pd.DataFrame, model: str, window: int = 9) -> None:
@@ -505,20 +559,8 @@ def main() -> int:
     tab.to_csv(OUT / "rq1_table.csv", index=False)
     write_tex(tab, OUT / "rq1_table.tex")
     losses(best).to_csv(OUT / "rq1_losses.csv", index=False)
-    fig_family(best)
-    fig_per_circuit(best)
-    fig_decomposition(best)
-    fig_family_raw(best)
-    fig_ising_large(best)
-    fig_ising_large_model(best)
-    fig_ising_large_model(best, "cultivation_pm", "fig1_ising_large_cultivation_pm",
-                          "cultivation at PureMagic's rate (mean 25.8 cycles/state)",
-                          ["Harvest", "EAF", "PureMagic"])
-    fig_metric_vs_size(best, "area", "space [tiles]", "fig1_tiles_vs_size", "tiles")
-    fig_metric_vs_size(best, "T", "makespan [timesteps]", "fig1_timesteps_vs_size", "timesteps")
     fig_geomean_bars(best)
-    for model in MODELS:
-        fig_by_size(best, model)
+    fig_family_bars(best)
     family_advantage(best).to_csv(OUT / "rq1_family_advantage.csv", index=False)
     print(tab.round(3).T.to_string())
     return 0

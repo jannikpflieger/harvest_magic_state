@@ -11,6 +11,8 @@ Outputs (``results/rq/rq2/``):
   rq2_ablation_summary.csv  geomean + 10th/90th percentile per variant/model(/template)
   rq2_placement_by_template.csv, rq2_sensitivity.csv, rq2_negotiation_cdf.csv
   fig3_ablation.pdf, fig3_sensitivity.pdf, fig3_negotiation_cdf.pdf
+  rq2_scheduler_ratios.csv, rq2_scheduler_summary.csv, fig3_scheduler_steps.pdf
+                            scheduler versions 2 and 3 step by step (study ``scheduler``)
 """
 
 from __future__ import annotations
@@ -151,7 +153,74 @@ def main() -> int:
     ax.legend(fontsize=7)
     style.save(fig, OUT / "fig3_negotiation_cdf")
     print(summary[summary.template == "all"].round(3).to_string(index=False))
+    scheduler_steps(df, full)
     return 0
+
+
+STEPS = ["+reuse", "+resched", "+reuse+resched"]
+STEP_LABELS = {"+reuse": "+ reuse cost\n(HARVEST-2)", "+resched": "+ prune &\nreschedule",
+               "+reuse+resched": "both\n(HARVEST-3)"}
+
+
+def scheduler_steps(df: pd.DataFrame, full: pd.DataFrame) -> None:
+    """Scheduler versions 2 and 3, step by step: volume, T and area vs full HARVEST, per template."""
+    import matplotlib.pyplot as plt
+
+    steps = ratios(df, "scheduler")
+    if steps.empty:
+        return
+    idx = list(zip(steps.circuit, steps.template, steps.model))
+    for col, name in (("volume", "volume_ratio"), ("T", "T_ratio"), ("area", "area_ratio"),
+                      ("compile_time_s", "compile_time_ratio")):
+        steps[name] = steps[col].values / full[col].reindex(idx).values
+    steps.to_csv(OUT / "rq2_scheduler_ratios.csv", index=False)
+    rows = []
+    for template in ["all", *sorted(steps.template.unique())]:
+        for (model, step), g in steps.groupby(["model", "ablation"]):
+            if template != "all":
+                g = g[g.template == template]
+            r = g.volume_ratio.dropna()
+            if r.empty:
+                continue
+            rows.append({"template": template, "model": model, "step": step, "n": len(r),
+                         "volume_ratio_geomean": geomean(r), "p10": r.quantile(0.1),
+                         "p90": r.quantile(0.9), "T_ratio_geomean": geomean(g.T_ratio),
+                         "area_ratio_geomean": geomean(g.area_ratio),
+                         "compile_time_ratio_geomean": geomean(g.compile_time_ratio),
+                         "share_better": (r < 0.999).mean(), "share_worse": (r > 1.001).mean()})
+    summary = pd.DataFrame(rows)
+    summary.to_csv(OUT / "rq2_scheduler_summary.csv", index=False)
+    print(summary[summary.template == "all"].round(3).to_string(index=False))
+
+    templates = ["all", *sorted(steps.template.unique())]
+    metrics = [("volume_ratio_geomean", "volume"), ("T_ratio_geomean", "makespan T"),
+               ("area_ratio_geomean", "area")]
+    fig, axes = plt.subplots(len(metrics), len(templates), figsize=(3.2 * len(templates), 7.5),
+                             sharey="row", squeeze=False)
+    x = np.arange(len(STEPS))
+    for j, template in enumerate(templates):
+        for i, (col, label) in enumerate(metrics):
+            ax = axes[i][j]
+            for k, model in enumerate(MODELS):
+                s = summary[(summary.template == template) & (summary.model == model)].set_index("step")
+                vals = s[col].reindex(STEPS).values
+                ax.bar(x + (k - 0.5) * 0.38, vals - 1, 0.36, bottom=1, color=style.MODEL_COLORS[model],
+                       label=model, edgecolor=style.SURFACE, linewidth=1)
+                for xi, v in zip(x + (k - 0.5) * 0.38, vals):
+                    if v == v:
+                        ax.text(xi, v, f"{v:.3f}", ha="center", va="bottom" if v >= 1 else "top",
+                                fontsize=6.5, color=style.INK2)
+            ax.axhline(1, color=style.INK2, linewidth=1)
+            ax.set_xticks(x)
+            ax.set_xticklabels([STEP_LABELS[s] for s in STEPS] if i == len(metrics) - 1 else [],
+                               fontsize=7)
+            ax.grid(axis="x", visible=False)
+            if i == 0:
+                ax.set_title(f"template: {template}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"geomean {label}\n÷ full HARVEST")
+    axes[0][0].legend(fontsize=7)
+    style.save(fig, OUT / "fig3_scheduler_steps")
 
 
 if __name__ == "__main__":

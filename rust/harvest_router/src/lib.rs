@@ -123,7 +123,44 @@ impl Router {
             }
         }
         let params = Params { max_iters, alpha, beta, capacity, stagnation_limit, greedy_fill, priorities,
-                              no_defer, match_initial, greedy_order: greedy_order.to_string() };
+                              no_defer, match_initial, greedy_order: greedy_order.to_string(), base: None };
+        let (results, s) = self.core.pack_harvest(&sets, &params);
+        Ok((to_out(results), (s.iterations, s.initial_routes, s.reroutes, s.conflicted_reroutes,
+                              s.dropped, s.filled, s.final_conflict_score, s.stopped_reason, s.no_defer_fired)))
+    }
+
+    /// ``pack_harvest`` with a reuse cost per node (``harvest2``): ``base[v]``
+    /// is added to every routing cost, including the initial routes, the
+    /// magic-terminal matching and the greedy fill.
+    #[pyo3(signature = (sets, base, max_iters, alpha, beta, capacity, stagnation_limit, greedy_fill,
+                        priorities=None, no_defer=false, match_initial=false, greedy_order="min_size"))]
+    #[allow(clippy::too_many_arguments)]
+    fn pack_harvest_reuse(
+        &mut self,
+        sets: Vec<SetIn>,
+        base: Vec<f64>,
+        max_iters: usize,
+        alpha: f64,
+        beta: f64,
+        capacity: i32,
+        stagnation_limit: usize,
+        greedy_fill: bool,
+        priorities: Option<Vec<f64>>,
+        no_defer: bool,
+        match_initial: bool,
+        greedy_order: &str,
+    ) -> PyResult<(Vec<SetOut>, StatsOut)> {
+        let sets = to_specs(sets);
+        if base.len() != self.core.g.len() {
+            return Err(PyValueError::new_err("one reuse cost per node"));
+        }
+        if let Some(p) = &priorities {
+            if p.len() != sets.len() {
+                return Err(PyValueError::new_err("one priority per terminal set"));
+            }
+        }
+        let params = Params { max_iters, alpha, beta, capacity, stagnation_limit, greedy_fill, priorities,
+                              no_defer, match_initial, greedy_order: greedy_order.to_string(), base: Some(base) };
         let (results, s) = self.core.pack_harvest(&sets, &params);
         Ok((to_out(results), (s.iterations, s.initial_routes, s.reroutes, s.conflicted_reroutes,
                               s.dropped, s.filled, s.final_conflict_score, s.stopped_reason, s.no_defer_fired)))

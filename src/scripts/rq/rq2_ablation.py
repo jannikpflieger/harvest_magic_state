@@ -20,6 +20,13 @@ unless placement is the ablated component):
 Sensitivity (blocks4 only): I_max (``max_iters``) in {0,1,2,4,8} and the
 congestion weights alpha in {1,2,4}, beta in {1,1.5,3}.
 
+Scheduler steps (study ``scheduler``, same templates and seeds as the
+ablation; reference = the ablation's ``full`` rows):
+
+* ``+reuse``          HARVEST-2: reuse cost cell 1 / magic 2 on unused tiles;
+* ``+resched``        HARVEST + prune the least-used tiles and reschedule;
+* ``+reuse+resched``  HARVEST-3 (both).
+
 Models: instant (1 run) and cultivation (3 seeds).  Suite: ``small`` tier.
 Output: ``results/rq/rq2/rq2.csv``.
 """
@@ -46,10 +53,12 @@ SENSITIVITY = {
     "alpha1": {"alpha": 1.0}, "alpha4": {"alpha": 4.0},
     "beta1": {"beta": 1.0}, "beta3": {"beta": 3.0},
 }
+SCHEDULER_STEPS = {"+reuse": "harvest2", "+resched": "harvest1r", "+reuse+resched": "harvest3"}
 COLUMNS = ["study", "ablation", "max_iters", "alpha", "beta", "stalled_total", "magic_wait_cycles",
            "nego_iterations_total", "reroutes_total", "dropped_total", "filled_total",
            "magic_retries_total", "deferrals_total", "mean_ops_per_step", "t_schedule_s",
-           "t_place_s", "placement_cost", "validated_pre", "validated_post", "n_violations"]
+           "t_place_s", "placement_cost", "validated_pre", "validated_post", "n_violations",
+           "reschedule_best_round", "volume_round0", "T_round0", "area_round0", "reschedule_rounds"]
 
 
 def build_tasks(circuits, templates, timeout):
@@ -66,6 +75,16 @@ def build_tasks(circuits, templates, timeout):
                             circ=circ, compiler="harvest", template=template, model=model,
                             seed=seed, hconfig=hconfig, timeout=timeout, extra=extra,
                             **layout_kw), cost))
+        for model, seeds in (("instant", [None]), ("cultivation", SEEDS)):
+            for seed in seeds:
+                for template in templates:
+                    for name, compiler in SCHEDULER_STEPS.items():
+                        key = run_key(EXP, "scheduler", circ["circuit"], name, template, model, seed)
+                        extra = {"study": "scheduler", "ablation": name, "variant": name}
+                        tasks.append(Task(EXP, key, "rq_common:run_in_tree", dict(
+                            circ=circ, compiler=compiler, template=template, model=model,
+                            seed=seed, timeout=timeout, extra=extra),
+                            cost * (3 if "resched" in name else 1)))
         for model, seeds in (("instant", [None]), ("cultivation", SENS_SEEDS)):
             for seed in seeds:
                 for name, hconfig in SENSITIVITY.items():

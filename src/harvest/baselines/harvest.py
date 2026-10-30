@@ -76,7 +76,8 @@ class HarvestAdapter(BaselineAdapter):
 
     ``config.options`` may carry ``harvest_config`` (HarvestConfig fields that
     differ from the defaults), ``scheduler`` (``"steiner_tree"``: the
-    sequential ablation baseline) and a magic model (``magic_model`` plus its
+    sequential ablation baseline; ``"harvest_reuse"``: HARVEST-2 with
+    ``reuse_cost``, see ``harvest.routing.scheduler_reuse``) and a magic model (``magic_model`` plus its
     mean, see ``harvest.baselines.cultivation``).  Keyword arguments besides
     ``dag``/``layout_engine``: ``preprocessing_runtime_s``, ``phase_times``
     (front-end phase timings), ``placement_cost``, ``validate`` (default
@@ -104,7 +105,7 @@ class HarvestAdapter(BaselineAdapter):
 
         harvest_config = HarvestConfig.from_mapping(config.options.get("harvest_config"))
         mode = config.options.get("scheduler", "harvest")
-        if mode not in ("harvest", "steiner_tree"):
+        if mode not in ("harvest", "steiner_tree", "harvest_reuse"):
             raise ValueError(f"unknown HARVEST scheduler mode {mode!r}")
         validate = kwargs.get("validate", True)
 
@@ -119,7 +120,15 @@ class HarvestAdapter(BaselineAdapter):
             # Every magic patch prepares one state at a time (see
             # harvest.baselines.cultivation for the supply models).
             processor.magic_source = source
-        results = processor.process_entire_dag(dag, mode=mode, config=harvest_config)
+        if mode == "harvest_reuse":
+            # HARVEST-2: reuse cost on unused tiles (harvest.routing.scheduler_reuse).
+            from harvest.routing.scheduler_reuse import ReuseCost, process_dag_with_harvest_reuse
+
+            results = process_dag_with_harvest_reuse(
+                processor, dag, config=harvest_config,
+                cost=ReuseCost.from_mapping(config.options.get("reuse_cost")))
+        else:
+            results = processor.process_entire_dag(dag, mode=mode, config=harvest_config)
         schedule_time = perf_counter() - started
         metadata = dict(getattr(processor, "_scheduling_metadata", {}))
         completed = bool(metadata.get("completed", False))

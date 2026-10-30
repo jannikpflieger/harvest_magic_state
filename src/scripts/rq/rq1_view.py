@@ -1,5 +1,6 @@
-"""Snapshot RQ1 view while runs are in progress: this branch's Harvest rows + the
-perf folder's other compilers (PureMagic, EAF, Litinski, O3LS),
+"""Snapshot RQ1 view while runs are in progress: this branch's Harvest rows +
+PureMagic from the perf folder and EAF / Litinski / O3LS from the main folder
+(the live baseline runs),
 Harvest restricted to circuits whose runs (per model) are all done; random circuits
 left out (real circuit families only); plots into results/rq/rq1_view."""
 import csv, sys
@@ -7,7 +8,11 @@ from collections import defaultdict
 from pathlib import Path
 
 branch = Path(sys.argv[1])
-perf = Path("/home/jannik/Documents/PhD/Harvest_PLDI/code/harvest_magic_state_perf/results/rq/rq1/rq1.csv")
+code = Path("/home/jannik/Documents/PhD/Harvest_PLDI/code")
+SOURCES = {"PureMagic": code / "harvest_magic_state_perf/results/rq/rq1/rq1.csv",
+           "EAF": code / "harvest_magic_state/results/rq/rq1/rq1.csv",
+           "Litinski": code / "harvest_magic_state/results/rq/rq1/rq1.csv",
+           "O3LS": code / "harvest_magic_state/results/rq/rq1/rq1.csv"}
 out = branch / "results" / "rq" / "rq1_view"
 out.mkdir(parents=True, exist_ok=True)
 
@@ -16,11 +21,14 @@ def read(path):
         r = csv.reader(f); header = next(r)
         return header, [dict(zip(header, row)) for row in r]
 
-h_head, h_rows = read(branch / "results" / "rq" / "rq1" / "rq1.csv")
-o_head, o_rows = read(perf)
 SKIP_FAMILIES = {"random"}
+h_head, h_rows = read(branch / "results" / "rq" / "rq1" / "rq1.csv")
+o_head, others = [], []
+for comp, path in SOURCES.items():
+    head, rows = read(path)
+    o_head += [c for c in head if c not in o_head]
+    others += [r for r in rows if r["compiler"] == comp and r["family"] not in SKIP_FAMILIES]
 harvest = [r for r in h_rows if r["compiler"] == "Harvest" and r["family"] not in SKIP_FAMILIES]
-others = [r for r in o_rows if r["compiler"] != "Harvest" and r["family"] not in SKIP_FAMILIES]
 # expected Harvest runs per (circuit, model): instant 1, cultivation 10 (3 for n >= 400), cultivation_pm 1
 seen = defaultdict(set)
 for r in harvest:

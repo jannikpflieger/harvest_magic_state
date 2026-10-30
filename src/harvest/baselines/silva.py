@@ -362,6 +362,10 @@ class SilvaEAFAdapter(BaselineAdapter):
                                                consumed=consumed)
         runtime = schedule_time + prune_time
         validation = validation_metadata(validation_pre, validation_post)
+        sink = kwargs.get("sink")
+        if sink is not None:
+            # as in the HARVEST adapter: the (pruned) processor for post-processing
+            sink.update(processor=processor, results=results, source=source)
         if kwargs.get("strict_validate") and validation["n_violations"]:
             raise ValidationError(
                 f"{config.circuit}/{config.variant}: {validation['n_violations']} violation(s); "

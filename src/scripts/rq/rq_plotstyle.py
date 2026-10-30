@@ -32,11 +32,16 @@ def apply():
 
 def plain_log(ax, axis="y"):
     """Plain-number tick labels (0.9, 1, 1.2) on a log axis instead of 1.2x10^0."""
-    from matplotlib.ticker import FormatStrFormatter, LogLocator
+    from matplotlib.ticker import LogLocator, NullFormatter
+
+    def fmt(v, _):
+        return f"{v:,.0f}" if v >= 1000 else f"{v:g}"
 
     target = ax.yaxis if axis == "y" else ax.xaxis
-    target.set_major_formatter(FormatStrFormatter("%g"))
-    target.set_minor_formatter(FormatStrFormatter("%g"))
+    lo, hi = ax.get_ylim() if axis == "y" else ax.get_xlim()
+    target.set_major_formatter(fmt)
+    # label minor ticks only on narrow axes (ratios); wide axes get crowded
+    target.set_minor_formatter(fmt if hi < 10 * lo else NullFormatter())
     target.set_minor_locator(LogLocator(subs=(2, 3, 5)))
 
 

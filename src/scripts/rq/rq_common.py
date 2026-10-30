@@ -310,15 +310,22 @@ def run_in_tree(circ, compiler: str, template: str, model: str, seed: Optional[i
                 y_factor: bool = True, magic_ring=None, magic_count=None, layout=None,
                 timeout: float = 3600, extra: Optional[Dict[str, Any]] = None,
                 sink: Optional[dict] = None, strict: bool = False,
-                fault: Optional[str] = None) -> Dict[str, Any]:
-    """One HARVEST (``compiler='harvest'``) or Silva EAF (``'eaf'``) trial.
+                fault: Optional[str] = None,
+                reuse_cost: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """One HARVEST (``compiler='harvest'``), HARVEST-2 (``'harvest2'``, with
+    ``reuse_cost``) or Silva EAF (``'eaf'``) trial.
 
     ``template='auto'`` runs every template of ``AUTO_TEMPLATES`` (see
     :func:`run_auto`)."""
     if template == "auto":
         return run_auto(circ, compiler, model, seed, hconfig=hconfig, placement=placement,
                         y_factor=y_factor, timeout=timeout, extra=extra, sink=sink,
-                        strict=strict, fault=fault)
+                        strict=strict, fault=fault, reuse_cost=reuse_cost)
+    if compiler in RESCHEDULE:
+        return run_reschedule(circ, compiler, template, model, seed, hconfig=hconfig,
+                              placement=placement, y_factor=y_factor, magic_ring=magic_ring,
+                              magic_count=magic_count, layout=layout, timeout=timeout, extra=extra,
+                              sink=sink, strict=strict, reuse_cost=reuse_cost)
     from harvest import faults
     from harvest.baselines.harvest import HarvestAdapter
     from harvest.baselines.silva import SilvaEAFAdapter
@@ -330,16 +337,20 @@ def run_in_tree(circ, compiler: str, template: str, model: str, seed: Optional[i
                                               magic_ring, magic_count)
     options = {**layout_options(template, magic_ring, magic_count), **model_options(model),
                "placement": placement if y_factor else f"{placement}_noy", "_timeout": timeout}
-    if hconfig and compiler == "harvest":
+    if hconfig and compiler in ("harvest", "harvest2"):
         options["harvest_config"] = dict(hconfig)
+    if compiler == "harvest2":
+        # HARVEST-2: HARVEST with a reuse cost on unused tiles (rq1_scheduler_2.py)
+        options["scheduler"] = "harvest_reuse"
+        options["reuse_cost"] = dict(reuse_cost or {})
     if fault:
         options["fault"] = fault
-    baseline, variant = (("harvest", "harvest") if compiler == "harvest"
-                         else ("silva", "silva_eaf_pruned"))
+    baseline, variant = {"harvest": ("harvest", "harvest"), "harvest2": ("harvest", "harvest2"),
+                         "eaf": ("silva", "silva_eaf_pruned")}[compiler]
     if compiler == "eaf":
         options["prune"] = True  # EAF's schedule priced on HARVEST's pruned footprint
     config = _run_config(circ, baseline, variant, options, seed, 0)
-    adapter = HarvestAdapter() if compiler == "harvest" else SilvaEAFAdapter()
+    adapter = SilvaEAFAdapter() if compiler == "eaf" else HarvestAdapter()
     if fault:
         os.environ[faults.ENV_VAR] = fault
     try:
@@ -351,10 +362,46 @@ def run_in_tree(circ, compiler: str, template: str, model: str, seed: Optional[i
         if fault:
             os.environ.pop(faults.ENV_VAR, None)
     row = result_row(config, result, circ, extra)
-    row["compiler"] = "Harvest" if compiler == "harvest" else "EAF"
+    row["compiler"] = {"harvest": "Harvest", "harvest2": "Harvest-2", "eaf": "EAF"}[compiler]
     row["template"] = template
     row["model"] = model
     row["compile_time_s"] = (row.get("compile_time_s") or 0.0) + t_place
+    return row
+
+
+# HARVEST-3 (harvest.routing.prune_reschedule): prune the least-used tiles and
+# schedule again, around HARVEST-2 ("harvest3") or plain HARVEST ("harvest1r",
+# the RQ2 step that isolates the rescheduling).
+RESCHEDULE = {"harvest3": ("harvest2", "Harvest-3"), "harvest1r": ("harvest", "Harvest+resched")}
+
+
+def run_reschedule(circ, compiler: str, template: str, model: str, seed: Optional[int], *,
+                   layout=None, sink: Optional[dict] = None, extra: Optional[Dict[str, Any]] = None,
+                   reschedule: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
+    """One HARVEST-3 trial: the base scheduler, then prune-and-reschedule rounds."""
+    import json
+
+    from harvest.routing.prune_reschedule import RescheduleConfig, prune_reschedule
+
+    base, label = RESCHEDULE[compiler]
+    compile_time = [0.0]
+
+    def schedule(reduced):
+        s = {}
+        row = run_in_tree(circ, base, template, model, seed, layout=reduced if reduced is not None else layout,
+                          sink=s, extra=extra, **kwargs)
+        compile_time[0] += row.get("compile_time_s") or 0.0
+        return row, s
+
+    row = prune_reschedule(schedule, circ["num_qubits"], RescheduleConfig(**(reschedule or {})))
+    rounds = row.pop("rounds")
+    row.update({"compiler": label, "variant": (extra or {}).get("variant", compiler),
+                "compile_time_s": compile_time[0], "reschedule_rounds": json.dumps(rounds),
+                "reschedule_best_round": row.pop("best_round"),
+                "volume_round0": rounds[0].get("volume"), "T_round0": rounds[0].get("T"),
+                "area_round0": rounds[0].get("area")})
+    if sink is not None:
+        sink.update(rounds=rounds)
     return row
 
 
@@ -394,8 +441,13 @@ def run_auto(circ, compiler: str, model: str, seed: Optional[int], *, timeout: f
 
 
 def run_external(circ, compiler: str, variant: str, model: str, seed: Optional[int],
-                 timeout: float = 3600, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """One Litinski / O3LS / PureMagic trial on the identical Pauli-product stream."""
+                 timeout: float = 3600, extra: Optional[Dict[str, Any]] = None,
+                 no_t_failures: Optional[bool] = None) -> Dict[str, Any]:
+    """One Litinski / O3LS / PureMagic trial on the identical Pauli-product stream.
+
+    ``no_t_failures`` (PureMagic only) overrides the default (``True`` only for
+    instant): ``True`` switches off PureMagic's 50% injection-failure /
+    S-correction tracking under a stochastic model (E13)."""
     import importlib
 
     circuit, dag = load_circuit(circ)
@@ -416,7 +468,7 @@ def run_external(circ, compiler: str, variant: str, model: str, seed: Optional[i
             # instant: states (almost) never wait, and T gates never fail
             "magic_state_lambda": (1.0 / MODELS[model]["cultivation_mean_cycles"]
                                    if "cultivation_mean_cycles" in MODELS[model] else 1e6),
-            "no_t_failures": model == "instant",
+            "no_t_failures": model == "instant" if no_t_failures is None else no_t_failures,
             "transpile_bin": TOOLS.get("puremagic_transpile_bin"),
         })
         adapter = PureMagicAdapter()
@@ -432,8 +484,9 @@ def run_external(circ, compiler: str, variant: str, model: str, seed: Optional[i
         # The work directory is per circuit/variant/seed; instant, cultivation
         # and cultivation_pm all use seed 42, so without the model in the path
         # concurrent runs read each other's ``*.schedule`` (newest file wins).
+        work = model if no_t_failures is None else f"{model}_notfail{int(no_t_failures)}"
         config = replace(config, executable=Path(TOOLS["puremagic_bin"]),
-                         output_dir=CACHE / "work" / model)
+                         output_dir=CACHE / "work" / work)
     with time_limit(timeout + 60 if compiler == "puremagic" else timeout):
         result = adapter.run(config, dag=dag)
     row = result_row(config, result, circ, extra)
@@ -544,8 +597,13 @@ class Task:
             self.keys = [self.key]
 
 
+# Experiments that keep their CSV outside ``results/rq`` register it here when
+# their module is imported (workers import a task's module before writing).
+CSV_PATHS: Dict[str, Path] = {}
+
+
 def csv_path(exp: str) -> Path:
-    return RESULTS / exp / f"{exp}.csv"
+    return CSV_PATHS.get(exp) or RESULTS / exp / f"{exp}.csv"
 
 
 def _execute(task: Task, columns: Sequence[str]) -> str:
